@@ -550,6 +550,8 @@ class MovementBodyV3:
             self._update_awareness_conf()
             return
 
+        # v1.2: Lees tile_span_cycles uit node (default 1.0 voor backward compat)
+        tile_span = float(node.get("tile_span_cycles", 1.0))
         s = self._direction_sign()
 
         if s != 0:
