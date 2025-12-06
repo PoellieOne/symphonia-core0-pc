@@ -553,18 +553,20 @@ class MovementBodyV3:
         s = self._direction_sign()
 
         if s != 0:
-            self._update_cycles_and_angle(t_us, s)
+            self._update_cycles_and_angle(t_us, s, tile_span)  # v1.2: geef tile_span mee
             self._update_rpm(t_us)
         else:
             self._update_motion_state_idle_like()
 
         self._update_awareness_conf()
 
-    def _update_cycles_and_angle(self, t_us: int, sign: int) -> None:
+    def _update_cycles_and_angle(self, t_us: int, sign: int, tile_span: float = 1.0) -> None:
         st = self._state
         C = st.cycles_per_rot if st.cycles_per_rot > 0 else self.cycles_per_rot_nominal
 
-        st.cycle_index += int(sign)
+        # v1.2 FIX: cycle_index schaling met tile_span_cycles
+        # 1 tile = tile_span cycles, dus we tellen tile_span per tile
+        st.cycle_index += sign * tile_span
         st.rotations = st.cycle_index / C
 
         theta_prev = st.theta_deg
