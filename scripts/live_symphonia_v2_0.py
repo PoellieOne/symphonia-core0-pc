@@ -3,23 +3,21 @@
 """
 live_symphonia_v2_0.py — Live ESP32 met L1 PhysicalActivity + L2 RealtimePipeline
 
-Integreert:
-- L1: PhysicalActivity (IDLE / TENSION / MOVING_RAW) via canonical l1_physical_activity.py
-- L2: RealtimePipeline v1.9 (Cycles → Tiles → Compass → MovementBody)
+S02.HandEncoder-Awareness v0.1 implementatie.
 
-L1 is een interpretatielaag BOVENOP L2:
-- L1 wijzigt NIETS aan L2
-- L1 geeft directe feedback over fysieke activiteit
-- L2 behoudt alle canonieke logica (Claim-at-Lock, compass, etc.)
+Changelog v2.0.2:
+- L1 v0.2: 5-state model (STILL/FEELING/SCRAPE/DISPLACEMENT/MOVING)
+- L1 gevoed met raw EVENT24 frame counts (events_this_batch)
+- L1 ontvangt L2 doorlus: rotations, direction_conf, lock_state, direction_effective
+- Display toont encoder-achtige observables: θ̂, Δθ̂, activity_score, encoder_conf
+
+Integreert:
+- L1: PhysicalActivity v0.2 (encoder-aware) via canonical l1_physical_activity.py
+- L2: RealtimePipeline v1.9 (Cycles → Tiles → Compass → MovementBody)
 
 Gebruik:
     python3 live_symphonia_v2_0.py [--port /dev/ttyUSB0] [--profile bench_tolerant]
     python3 live_symphonia_v2_0.py --gap-ms 500 --log
-
-Changelog v2.0.1:
-- VERWIJDERD: Inline L1State, L1Config, L1PhysicalActivity classes (regel 161-259)
-- TOEGEVOEGD: Canonical import van l1_physical_activity module
-- HARMONISATIE: Live en replay gebruiken nu identieke L1 implementatie
 """
 
 import os
@@ -36,18 +34,13 @@ from typing import Dict, Any, Optional, List
 
 # === Symlink proof =================================================
 
-# Altijd beginnen bij de "echte" file-locatie (symlink-proof)
 HERE = Path(__file__).resolve()
-
-# 1) Optioneel: expliciete override via env var, bv:
-#    export SYMPHONIA_ROOT=/home/ralph/PoellieOne/symphonia-core0-pc
 env_root = os.getenv("SYMPHONIA_ROOT")
 PROJECT_ROOT = None
 
 if env_root:
     PROJECT_ROOT = Path(env_root).expanduser().resolve()
 else:
-    # 2) Automatisch: loop omhoog totdat we een 'sym_cycles' map vinden
     for parent in [HERE.parent, *HERE.parents]:
         if (parent / "sym_cycles").exists():
             PROJECT_ROOT = parent
@@ -59,7 +52,6 @@ if PROJECT_ROOT is None:
         "Zet SYMPHONIA_ROOT of zorg dat er ergens boven deze file een 'sym_cycles/' map staat."
     )
 
-# 3) Zorg dat Python dit als import-root ziet
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -164,25 +156,21 @@ def decode_flags(flags0, flags1):
 
 
 # === L1 PHYSICAL ACTIVITY (canonical import) =================================
-#
-# VERWIJDERD: Inline implementatie van L1State, L1Config, L1PhysicalActivity
-# NU: Canonical import uit l1_physical_activity.py
-#
-# Dit garandeert dat live én replay dezelfde L1 implementatie gebruiken.
 
 try:
     from sym_cycles.l1_physical_activity import (
         L1PhysicalActivity,
         L1Config,
         L1State,
+        L1Snapshot,
     )
 except ImportError:
-    # Fallback: probeer direct uit huidige directory
     try:
         from l1_physical_activity import (
             L1PhysicalActivity,
             L1Config,
             L1State,
+            L1Snapshot,
         )
     except ImportError:
         raise ImportError(
@@ -205,8 +193,9 @@ class TerminalUI:
     CYAN = "\033[96m"
     MAGENTA = "\033[95m"
     DIM = "\033[2m"
+    BLUE = "\033[94m"
     
-    def __init__(self, num_lines=16):
+    def __init__(self, num_lines=18):
         self.num_lines = num_lines
         self.initialized = False
         
@@ -230,49 +219,54 @@ class TerminalUI:
 
 
 def format_display(
-    l1_snap: dict,
+    l1_snap: L1Snapshot,
     l2_snap: dict,
     events_per_sec: float,
     elapsed: float,
 ) -> list:
-    """Format L1 + L2 state voor terminal display."""
+    """Format L1 + L2 state voor terminal display (encoder-aware)."""
     ui = TerminalUI
     lines = []
     
     # Header
     lines.append(f"{ui.BOLD}═══════════════════════════════════════════════════════════════{ui.RESET}")
-    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0 — L1 Physical + L2 Awareness{ui.RESET}")
+    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0 — L1 Encoder-Aware + L2 Awareness{ui.RESET}")
     lines.append(f"═══════════════════════════════════════════════════════════════")
     
-    # L1 Physical Activity
-    l1_state = l1_snap.get("l1_state", L1State.IDLE)
-    # Handle both enum and string
-    if hasattr(l1_state, 'value'):
-        l1_state_str = l1_state.value
-    else:
-        l1_state_str = str(l1_state)
+    # L1 State (5-state model)
+    l1_state = l1_snap.state
+    l1_state_str = l1_state.value if hasattr(l1_state, 'value') else str(l1_state)
     
-    gap_cycle = l1_snap.get("gap_since_cycle_ms", float('inf'))
-    events_no_cycles = l1_snap.get("events_without_cycles", 0)
+    state_colors = {
+        "STILL": ui.DIM,
+        "FEELING": ui.BLUE,
+        "SCRAPE": ui.YELLOW,
+        "DISPLACEMENT": ui.MAGENTA,
+        "MOVING": ui.GREEN,
+    }
+    state_icons = {
+        "STILL": "○",
+        "FEELING": "◐",
+        "SCRAPE": "◎",
+        "DISPLACEMENT": "◑",
+        "MOVING": "◉",
+    }
     
-    if l1_state_str == "MOVING_RAW":
-        l1_color = ui.GREEN
-        l1_icon = "◉"
-    elif l1_state_str == "TENSION":
-        l1_color = ui.YELLOW
-        l1_icon = "◎"
-    else:
-        l1_color = ui.DIM
-        l1_icon = "○"
+    l1_color = state_colors.get(l1_state_str, ui.RESET)
+    l1_icon = state_icons.get(l1_state_str, "?")
     
-    gap_str = f"{gap_cycle:.0f}ms" if gap_cycle < 10000 else "∞"
+    lines.append(f"  {ui.BOLD}L1 State:{ui.RESET}     {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET}")
     
-    lines.append(f"  {ui.BOLD}L1 Physical:{ui.RESET}  {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET} gap={gap_str}")
+    # L1 Encoder metrics
+    theta_hat = l1_snap.theta_hat_rot
+    delta_theta = l1_snap.delta_theta_rot
+    activity = l1_snap.activity_score
+    disp = l1_snap.disp_score
+    enc_conf = l1_snap.encoder_conf
     
-    if l1_state_str == "TENSION":
-        lines.append(f"               {ui.YELLOW}↳ events without cycles: {events_no_cycles}{ui.RESET}")
-    else:
-        lines.append(f"               ")
+    lines.append(f"  θ̂:           {theta_hat:+8.3f} rot   Δθ̂: {delta_theta:+.4f}")
+    lines.append(f"  Activity:    {activity:8.1f} ev/s  Disp: {disp:.4f}")
+    lines.append(f"  Encoder Conf: {enc_conf:7.2f}")
     
     lines.append(f"───────────────────────────────────────────────────────────────")
     
@@ -301,13 +295,12 @@ def format_display(
     # Metrics
     rotations = l2_snap.get("rotations", 0)
     cycles_total = l2_snap.get("total_cycles_physical", 0)
-    cycles_claimed = l2_snap.get("cycles_claimed_at_lock", 0)
     rpm = l2_snap.get("rpm_est", 0)
     
     compass = l2_snap.get("compass_snapshot")
     score = compass.global_score if compass else 0
     
-    lines.append(f"  Rotaties:   {ui.BOLD}{rotations:+8.2f}{ui.RESET}     Cycles: {cycles_total:.0f} (claimed: {cycles_claimed:.0f})")
+    lines.append(f"  Rotaties:   {ui.BOLD}{rotations:+8.2f}{ui.RESET}     Cycles: {cycles_total:.0f}")
     lines.append(f"  RPM:        {rpm:8.1f}       Score: {score:+.3f}")
     lines.append(f"  Events/s:   {events_per_sec:8.1f}       Tijd: {elapsed:.1f}s")
     
@@ -320,7 +313,7 @@ def format_display(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Live ESP32 met L1 PhysicalActivity + L2 RealtimePipeline'
+        description='Live ESP32 met L1 Encoder-Aware + L2 RealtimePipeline'
     )
     parser.add_argument('--port', '-p', default='/dev/ttyUSB0')
     parser.add_argument('--baud', '-b', type=int, default=115200)
@@ -328,8 +321,8 @@ def main():
                        default='bench_tolerant')
     parser.add_argument('--gap-ms', type=float, default=500.0,
                        help='L1 gap threshold (default: 500)')
-    parser.add_argument('--tension-ms', type=float, default=300.0,
-                       help='L1 tension window (default: 300)')
+    parser.add_argument('--disp-threshold', type=float, default=0.01,
+                       help='L1 displacement threshold (default: 0.01 rot)')
     parser.add_argument('--min-normal-tile', type=int, default=2)
     parser.add_argument('--log', '-l', action='store_true',
                        help='Log to JSONL file')
@@ -352,9 +345,8 @@ def main():
             PROFILE_PRODUCTION, PROFILE_BENCH, PROFILE_BENCH_TOLERANT,
         )
     except ImportError:
-        # Try loading from same directory
         import importlib.util
-        base_dir = Path(__file__).resolve().parent  # volg symlink naar de échte file
+        base_dir = Path(__file__).resolve().parent
         spec = importlib.util.spec_from_file_location(
             "realtime_states",
             base_dir / "realtime_states_v1_9_canonical.py"
@@ -369,7 +361,6 @@ def main():
             PROFILE_BENCH_TOLERANT = module.PROFILE_BENCH_TOLERANT
         else:
             print("❌ realtime_states_v1_9_canonical.py niet gevonden!")
-            print("   Zorg dat dit bestand in dezelfde directory staat.")
             return 1
     
     # Select L2 profile
@@ -406,11 +397,14 @@ def main():
             cycles_per_rot=l2_profile.cycles_per_rot,
         )
     
-    # Create L1 config (using canonical L1Config from l1_physical_activity.py)
+    # Create L1 config (encoder-aware v0.2)
     l1_config = L1Config(
         gap_ms=args.gap_ms,
-        tension_window_ms=args.tension_ms,
-        tension_min_events=3,
+        displacement_threshold=args.disp_threshold,
+        activity_threshold_low=1.0,
+        activity_threshold_high=5.0,
+        direction_conf_threshold=0.5,
+        cycles_per_rot=l2_profile.cycles_per_rot,
     )
     
     # Open serial
@@ -424,23 +418,25 @@ def main():
     # Create components
     fs = FrameStream(ser)
     l2_pipeline = RealtimePipeline(profile=l2_profile)
-    l1_activity = L1PhysicalActivity(config=l1_config)  # Canonical L1!
+    l1_activity = L1PhysicalActivity(config=l1_config)
     
     # Setup logging
     log_file = None
     if args.log:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = f"live_l1l2_{timestamp}.jsonl"
+        log_path = f"live_encoder_{timestamp}.jsonl"
         log_file = open(log_path, 'w')
         print(f"[i] Logging to: {log_path}")
     
     # Setup UI
-    ui = None if args.simple else TerminalUI(num_lines=16)
+    ui = None if args.simple else TerminalUI(num_lines=18)
     
     print(f"[i] L2 Profile: {l2_profile.name}")
-    print(f"[i] L1 Config: gap={args.gap_ms}ms, tension={args.tension_ms}ms")
-    print(f"[i] L1 Source: canonical l1_physical_activity.py")
+    print(f"[i] L1 Config: gap={args.gap_ms}ms, disp_thresh={args.disp_threshold}")
+    print(f"[i] L1 Source: canonical l1_physical_activity.py v0.2 (encoder-aware)")
     print(f"[i] Listening... (Ctrl+C to stop)")
+    print()
+    print(f"[i] L1 States: ○STILL → ◐FEELING → ◎SCRAPE → ◑DISPLACEMENT → ◉MOVING")
     print()
     
     if ui:
@@ -452,13 +448,13 @@ def main():
     events_window = deque(maxlen=100)
     total_events = 0
     
-    l1_snap = {"l1_state": L1State.IDLE}
+    l1_snap = L1Snapshot(state=L1State.STILL)
     l2_snap = {}
     
     try:
         while True:
             now = time.time()
-            events_this_batch = 0
+            events_this_batch = 0  # Raw EVENT24 frame count!
             
             # Process frames
             for frame_type, ver, payload in fs.read_frames():
@@ -480,36 +476,55 @@ def main():
                 l2_result = l2_pipeline.feed_event(ev)
                 l2_snap = l2_result.movement_state
                 l2_snap["compass_snapshot"] = l2_result.compass_snapshot
-                
-                # Log
-                if log_file:
-                    log_entry = {
-                        "t": now - t0,
-                        "event": ev,
-                        "l2": {
-                            "rotor_state": l2_snap.get("rotor_state"),
-                            "direction_lock_state": l2_snap.get("direction_lock_state"),
-                            "total_cycles_physical": l2_snap.get("total_cycles_physical"),
-                        }
-                    }
-                    log_file.write(json.dumps(log_entry) + "\n")
             
-            # Update L1 (always, even without events) — using canonical L1PhysicalActivity
+            # === Update L1 met alle benodigde data ===
             cycles_total = l2_snap.get("total_cycles_physical", 0)
-            l1_snap_obj = l1_activity.update(
+            rotations = l2_snap.get("rotations", 0)
+            
+            # Direction confidence van compass
+            compass_snap = l2_snap.get("compass_snapshot")
+            direction_conf = 0.0
+            if compass_snap:
+                direction_conf = getattr(compass_snap, 'confidence', 0.0)
+                if direction_conf == 0.0:
+                    # Fallback: gebruik global_score magnitude als proxy
+                    direction_conf = abs(getattr(compass_snap, 'global_score', 0.0))
+            
+            lock_state = l2_snap.get("direction_lock_state", "UNLOCKED")
+            direction_effective = l2_snap.get("direction_global_effective", "UNDECIDED")
+            
+            l1_snap = l1_activity.update(
                 wall_time=now,
                 cycles_physical_total=cycles_total,
-                events_this_batch=events_this_batch,
+                events_this_batch=events_this_batch,  # Raw EVENT24 frames!
+                rotations=rotations,
+                direction_conf=direction_conf,
+                lock_state=lock_state,
+                direction_effective=direction_effective,
             )
             
-            # Convert L1Snapshot to dict for display compatibility
-            l1_snap = {
-                "l1_state": l1_snap_obj.state,
-                "gap_since_cycle_ms": l1_snap_obj.gap_since_cycle_ms,
-                "gap_since_event_ms": l1_snap_obj.gap_since_event_ms,
-                "events_without_cycles": l1_snap_obj.events_without_cycles,
-                "delta_cycles": l1_snap_obj.delta_cycles,
-            }
+            # Log
+            if log_file and events_this_batch > 0:
+                log_entry = {
+                    "t": now - t0,
+                    "events_batch": events_this_batch,
+                    "l1": {
+                        "state": l1_snap.state.value,
+                        "theta_hat_rot": l1_snap.theta_hat_rot,
+                        "delta_theta_rot": l1_snap.delta_theta_rot,
+                        "activity_score": l1_snap.activity_score,
+                        "disp_score": l1_snap.disp_score,
+                        "encoder_conf": l1_snap.encoder_conf,
+                    },
+                    "l2": {
+                        "rotor_state": l2_snap.get("rotor_state"),
+                        "lock_state": lock_state,
+                        "direction": direction_effective,
+                        "rotations": rotations,
+                        "rpm_est": l2_snap.get("rpm_est", 0),
+                    }
+                }
+                log_file.write(json.dumps(log_entry) + "\n")
             
             # Update display
             if now - last_display > 0.1:
@@ -521,15 +536,13 @@ def main():
                     lines = format_display(l1_snap, l2_snap, events_per_sec, elapsed)
                     ui.update(lines)
                 elif args.simple:
-                    l1_state = l1_snap.get("l1_state", L1State.IDLE)
-                    # Handle enum
-                    l1_state_str = l1_state.value if hasattr(l1_state, 'value') else str(l1_state)
+                    l1_state_str = l1_snap.state.value
                     rotor = l2_snap.get("rotor_state", "STILL")
                     lock = l2_snap.get("direction_lock_state", "UNLOCKED")
-                    rot = l2_snap.get("rotations", 0)
+                    theta = l1_snap.theta_hat_rot
                     
-                    print(f"\r[{elapsed:6.1f}s] L1:{l1_state_str:12} | L2:{rotor:9}/{lock:10} | "
-                          f"rot={rot:+6.2f} | ev/s={events_per_sec:3.0f}   ",
+                    print(f"\r[{elapsed:6.1f}s] L1:{l1_state_str:12} θ̂={theta:+.2f} | "
+                          f"L2:{rotor:9}/{lock:10} | ev/s={events_per_sec:3.0f}   ",
                           end='', flush=True)
                 
                 last_display = now
@@ -556,14 +569,18 @@ def main():
         print(f"  Total events:    {total_events}")
         print(f"  Total cycles:    {final_l2.get('total_cycles_physical', 0):.0f}")
         print()
-        l1_final = l1_snap.get('l1_state', L1State.IDLE)
-        l1_final_str = l1_final.value if hasattr(l1_final, 'value') else str(l1_final)
-        print(f"  L1 Final:        {l1_final_str}")
+        print(f"  L1 Final State:  {l1_snap.state.value}")
+        print(f"  L1 θ̂ (rot):      {l1_snap.theta_hat_rot:.3f}")
+        print(f"  L1 Encoder Conf: {l1_snap.encoder_conf:.2f}")
+        print()
         print(f"  L2 Final:        {final_l2.get('rotor_state', 'STILL')} / "
               f"{final_l2.get('direction_lock_state', 'UNLOCKED')} / "
               f"{final_l2.get('direction_global_effective', 'UNDECIDED')}")
-        print(f"  Rotations:       {final_l2.get('rotations', 0):.2f}")
+        print(f"  L2 Rotations:    {final_l2.get('rotations', 0):.2f}")
         print("=" * 65)
+        
+        if args.log:
+            print(f"\n[i] Log saved to: live_encoder_*.jsonl")
     
     return 0
 
