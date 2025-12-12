@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-l1_physical_activity.py — L1 PhysicalActivity Layer v0.3 (Encoder-Aware + Decay)
+l1_physical_activity.py — L1 PhysicalActivity Layer v0.4 (Observability)
 
-S02.HandEncoder-Awareness v0.1 — Patch A/B/C implementatie.
+S02.HandEncoder-Awareness — Patch D2: Reason codes + threshold export.
 
-Changelog v0.3:
-- PATCH A: θ̂ nu ALTIJD uit cycles_physical_total / cycles_per_rot (niet rotations!)
-- PATCH B1: encoder_conf time-decay: conf *= exp(-dt_s / tau_s)
-- PATCH B2: Hard gap reset: bij dt > hard_reset_s → conf=0, state=STILL
-- FIX: activity_score decay bij geen events
-- FIX: disp_score is altijd unsigned |Δθ̂|
+Changelog v0.4:
+- PATCH D2: reason codes bij state transitions
+- PATCH D2: thresholds dict in snapshot voor debug
+- FIX: reason explains WHY state was chosen
+- Alle v0.3 patches behouden (A/B/C)
 
-Kernprincipes:
-- θ̂ = unsigned fysieke progress (cycles_total / cycles_per_rot)
-- θ̂ verandert VÓÓR lock (zodra cycles toenemen)
-- encoder_conf vervalt exponentieel zonder nieuwe input
-- State valt terug naar STILL bij stilte
-
-States:
-- STILL:        Geen activiteit, geen displacement
-- FEELING:      Lichte activiteit (events), geen displacement
-- SCRAPE:       Hoge activiteit, geen displacement (edge oscillatie)
-- DISPLACEMENT: Netto displacement, direction nog onzeker
-- MOVING:       Displacement + direction stabiel
+Reason codes:
+- STILL_GAP_TIMEOUT: geen events/cycles binnen gap_ms
+- STILL_LOW_ACTIVITY: activity < A0 en disp < D0
+- FEELING_ACTIVITY_NO_DISP: activity >= A0, disp < D0
+- SCRAPE_HIGH_ACTIVITY: activity >= A1, disp < D0
+- DISP_ABOVE_D0: |Δθ| >= D0, direction unstable
+- MOVING_STABLE_DIR: |Δθ| >= D0, direction stable (conf >= C0)
+- MOVING_LOCKED: |Δθ| >= D0, lock in SOFT_LOCK/LOCKED
+- HARD_RESET_GAP: dt > hard_reset_s triggered
+- DECAY_ACTIVE: encoder_conf decaying (no state change)
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
 from enum import Enum
-from collections import deque
 import math
 
 
 class L1State(Enum):
-    """L1 PhysicalActivity states (v0.3 encoder-aware)."""
+    """L1 PhysicalActivity states."""
     STILL = "STILL"
     FEELING = "FEELING"
     SCRAPE = "SCRAPE"
@@ -43,65 +39,76 @@ class L1State(Enum):
     MOVING = "MOVING"
 
 
+class L1Reason(Enum):
+    """Reason codes for L1 state (Patch D2)."""
+    STILL_GAP_TIMEOUT = "STILL_GAP_TIMEOUT"
+    STILL_LOW_ACTIVITY = "STILL_LOW_ACTIVITY"
+    FEELING_ACTIVITY_NO_DISP = "FEELING_ACTIVITY_NO_DISP"
+    SCRAPE_HIGH_ACTIVITY = "SCRAPE_HIGH_ACTIVITY"
+    DISP_ABOVE_D0 = "DISP_ABOVE_D0"
+    MOVING_STABLE_DIR = "MOVING_STABLE_DIR"
+    MOVING_LOCKED = "MOVING_LOCKED"
+    HARD_RESET_GAP = "HARD_RESET_GAP"
+    DECAY_ACTIVE = "DECAY_ACTIVE"
+    INIT = "INIT"
+
+
 @dataclass
 class L1Config:
-    """
-    Configuratie voor L1 PhysicalActivity (v0.3 met decay).
-    
-    Patch A: θ̂ bron
-    - cycles_per_rot: cycles per volledige rotatie (default 12)
-    
-    Patch B: Time decay
-    - encoder_tau_s: exponentiële decay tijdconstante
-    - hard_reset_s: force reset na deze stilte
-    - activity_decay_rate: activity score decay per seconde
-    """
+    """Configuratie voor L1 PhysicalActivity (v0.4)."""
     # Gap threshold
     gap_ms: float = 500.0
     
-    # Activity thresholds (events per seconde)
-    activity_threshold_low: float = 1.0    # A0: STILL → FEELING
-    activity_threshold_high: float = 5.0   # A1: FEELING → SCRAPE
+    # Activity thresholds
+    activity_threshold_low: float = 1.0    # A0
+    activity_threshold_high: float = 5.0   # A1
     
-    # Displacement threshold (rotations per update)
-    displacement_threshold: float = 0.005  # D0: min |Δθ̂| voor DISPLACEMENT
+    # Displacement threshold
+    displacement_threshold: float = 0.005  # D0 (rotations)
     
     # Direction thresholds
-    direction_conf_threshold: float = 0.5
+    direction_conf_threshold: float = 0.5  # C0
     lock_states_for_moving: tuple = ("SOFT_LOCK", "LOCKED")
     
-    # Cycles per rotation (Patch A)
+    # Cycles per rotation
     cycles_per_rot: float = 12.0
     
-    # Time decay parameters (Patch B)
-    encoder_tau_s: float = 0.6       # Decay tijdconstante
-    hard_reset_s: float = 1.5        # Hard reset na stilte
-    activity_decay_rate: float = 5.0  # Activity decay per seconde
+    # Time decay (Patch B)
+    encoder_tau_s: float = 0.6
+    hard_reset_s: float = 1.5
+    activity_decay_rate: float = 5.0
 
 
 @dataclass
 class L1Snapshot:
-    """Snapshot van L1 state (v0.3 met decay info)."""
+    """
+    Snapshot van L1 state (v0.4 met reason codes).
+    
+    Patch D2: reason + thresholds voor debug.
+    """
     state: L1State
+    reason: L1Reason  # WHY this state was chosen
     
-    # Virtuele hoek θ̂ (encoder-achtig, uit cycles!)
+    # θ̂ (uit cycles)
     theta_hat_rot: float = 0.0
+    theta_hat_deg: float = 0.0      # Patch D1: degrees
     delta_theta_rot: float = 0.0
+    delta_theta_deg: float = 0.0    # Patch D1: degrees
     
-    # Activity metrics
+    # Activity
     activity_score: float = 0.0
     disp_score: float = 0.0
     
-    # Doorgeluste L2 info
+    # L2 doorlus
     direction_effective: str = "UNDECIDED"
     direction_conf: float = 0.0
     lock_state: str = "UNLOCKED"
     
-    # Encoder confidence (met decay!)
+    # Encoder confidence
     encoder_conf: float = 0.0
     
     # Timing
-    dt_s: float = 0.0                       # Tijd sinds vorige update
+    dt_s: float = 0.0
     t_last_cycle: Optional[float] = None
     t_last_event: Optional[float] = None
     gap_since_cycle_ms: float = float('inf')
@@ -109,27 +116,29 @@ class L1Snapshot:
     
     # Counters
     total_cycles: float = 0.0
+    delta_cycles: float = 0.0       # Patch D1
     total_events: int = 0
-    delta_cycles: float = 0.0
     delta_events: int = 0
     events_without_cycles: int = 0
+    
+    # Thresholds (Patch D2: voor debug)
+    thresholds: Dict[str, Any] = field(default_factory=dict)
 
 
 class L1PhysicalActivity:
     """
-    L1 PhysicalActivity Layer v0.3 (Encoder-Aware + Time Decay).
+    L1 PhysicalActivity Layer v0.4 (Observability).
     
-    Patch A: θ̂ = cycles_physical_total / cycles_per_rot (unsigned progress)
-    Patch B: encoder_conf decays exponentially, hard reset na stilte
+    Patch D2: Every state decision comes with a reason code.
     """
     
     def __init__(self, config: L1Config = None):
         self.config = config or L1Config()
         
-        # State
         self._state: L1State = L1State.STILL
+        self._reason: L1Reason = L1Reason.INIT
         
-        # θ̂ integrator (Patch A: uit cycles, niet rotations!)
+        # θ̂
         self._theta_hat_rot: float = 0.0
         self._prev_theta_hat_rot: float = 0.0
         
@@ -143,10 +152,8 @@ class L1PhysicalActivity:
         self._total_events: int = 0
         self._events_without_cycles: int = 0
         
-        # Activity tracking (met decay)
+        # Activity + confidence
         self._activity_score: float = 0.0
-        
-        # Encoder confidence (met decay)
         self._encoder_conf: float = 0.0
         
         # L2 doorlus
@@ -159,31 +166,23 @@ class L1PhysicalActivity:
         return self._state
     
     @property
-    def theta_hat_rot(self) -> float:
-        return self._theta_hat_rot
+    def reason(self) -> L1Reason:
+        return self._reason
     
     def update(
         self,
         wall_time: float,
         cycles_physical_total: float,
         events_this_batch: int = 0,
-        # Optionele L2 doorlus (voor MOVING state)
         direction_conf: float = None,
         lock_state: str = None,
         direction_effective: str = None,
-        # NIET MEER GEBRUIKEN voor θ̂:
-        rotations: float = None,  # Ignored! θ̂ komt uit cycles
+        rotations: float = None,  # Ignored
     ) -> L1Snapshot:
-        """
-        Update L1 state.
-        
-        Patch A: θ̂ = cycles_physical_total / cycles_per_rot
-        Patch B: Time decay op activity en encoder_conf
-        Patch C: Wordt aangeroepen met events_this_batch=0 bij idle tick
-        """
+        """Update L1 state met reason tracking."""
         cfg = self.config
         
-        # === Timing (Patch B) ===
+        # === Timing ===
         dt_s = 0.0
         if self._t_last_update is not None:
             dt_s = wall_time - self._t_last_update
@@ -192,19 +191,24 @@ class L1PhysicalActivity:
         # === Hard reset check (Patch B2) ===
         if dt_s > cfg.hard_reset_s:
             self._hard_reset()
-            dt_s = 0.0  # Na reset, geen decay toepassen
+            self._reason = L1Reason.HARD_RESET_GAP
+            dt_s = 0.0
         
-        # === Delta berekeningen ===
+        # === Deltas ===
         delta_cycles = cycles_physical_total - self._prev_cycles_total
         self._prev_cycles_total = cycles_physical_total
         
         delta_events = events_this_batch
         self._total_events += events_this_batch
         
-        # === θ̂ uit cycles (Patch A - NIET uit rotations!) ===
+        # === θ̂ uit cycles (Patch A) ===
         self._prev_theta_hat_rot = self._theta_hat_rot
         self._theta_hat_rot = cycles_physical_total / cfg.cycles_per_rot
         delta_theta_rot = self._theta_hat_rot - self._prev_theta_hat_rot
+        
+        # Degrees (Patch D1)
+        theta_hat_deg = (self._theta_hat_rot * 360.0) % 360.0
+        delta_theta_deg = delta_theta_rot * 360.0
         
         # === Timing updates ===
         if delta_cycles > 0:
@@ -224,7 +228,7 @@ class L1PhysicalActivity:
         if direction_effective is not None:
             self._direction_effective = direction_effective
         
-        # === Gap berekening ===
+        # === Gaps ===
         gap_since_cycle_ms = float('inf')
         if self._t_last_cycle is not None:
             gap_since_cycle_ms = (wall_time - self._t_last_cycle) * 1000.0
@@ -233,48 +237,58 @@ class L1PhysicalActivity:
         if self._t_last_event is not None:
             gap_since_event_ms = (wall_time - self._t_last_event) * 1000.0
         
-        # === Activity score met decay (Patch B) ===
-        # Decay bestaande score
+        # === Activity decay (Patch B1) ===
         if dt_s > 0:
             decay_factor = math.exp(-dt_s * cfg.activity_decay_rate)
             self._activity_score *= decay_factor
-        
-        # Voeg nieuwe events toe
         self._activity_score += delta_events
         
         # === Displacement score ===
         disp_score = abs(delta_theta_rot)
         
-        # === Encoder confidence met decay (Patch B1) ===
+        # === Encoder conf decay (Patch B1) ===
         if dt_s > 0:
             decay_factor = math.exp(-dt_s / cfg.encoder_tau_s)
             self._encoder_conf *= decay_factor
         
-        # Boost encoder_conf bij activiteit/displacement
+        # Boost
         if delta_cycles > 0:
             self._encoder_conf = min(1.0, self._encoder_conf + 0.15)
         elif delta_events > 0:
             self._encoder_conf = min(1.0, self._encoder_conf + 0.05)
         
-        # Lock/direction boost
         if self._lock_state == "LOCKED":
             self._encoder_conf = min(1.0, self._encoder_conf + 0.1 * dt_s)
         
-        # Clamp
         self._encoder_conf = max(0.0, min(1.0, self._encoder_conf))
         
-        # === State machine ===
-        self._state = self._compute_state(
+        # === State machine met reason (Patch D2) ===
+        self._state, self._reason = self._compute_state_with_reason(
             activity_score=self._activity_score,
             disp_score=disp_score,
             gap_since_cycle_ms=gap_since_cycle_ms,
             gap_since_event_ms=gap_since_event_ms,
         )
         
+        # === Thresholds dict (Patch D2) ===
+        thresholds = {
+            "A0": cfg.activity_threshold_low,
+            "A1": cfg.activity_threshold_high,
+            "D0": cfg.displacement_threshold,
+            "D0_deg": cfg.displacement_threshold * 360.0,
+            "C0": cfg.direction_conf_threshold,
+            "gap_ms": cfg.gap_ms,
+            "tau_s": cfg.encoder_tau_s,
+            "hard_reset_s": cfg.hard_reset_s,
+        }
+        
         return L1Snapshot(
             state=self._state,
+            reason=self._reason,
             theta_hat_rot=self._theta_hat_rot,
+            theta_hat_deg=theta_hat_deg,
             delta_theta_rot=delta_theta_rot,
+            delta_theta_deg=delta_theta_deg,
             activity_score=self._activity_score,
             disp_score=disp_score,
             direction_effective=self._direction_effective,
@@ -287,65 +301,66 @@ class L1PhysicalActivity:
             gap_since_cycle_ms=gap_since_cycle_ms,
             gap_since_event_ms=gap_since_event_ms,
             total_cycles=cycles_physical_total,
-            total_events=self._total_events,
             delta_cycles=delta_cycles,
+            total_events=self._total_events,
             delta_events=delta_events,
             events_without_cycles=self._events_without_cycles,
+            thresholds=thresholds,
         )
     
-    def _compute_state(
+    def _compute_state_with_reason(
         self,
         activity_score: float,
         disp_score: float,
         gap_since_cycle_ms: float,
         gap_since_event_ms: float,
-    ) -> L1State:
+    ) -> tuple[L1State, L1Reason]:
         """
-        State machine:
-        - Gap timeout → STILL
-        - Displacement → DISPLACEMENT/MOVING
-        - Activity only → FEELING/SCRAPE
+        State machine met reason codes (Patch D2).
+        
+        Returns (state, reason) tuple.
         """
         cfg = self.config
         
-        # Gap timeout → STILL
+        # 1) Gap timeout → STILL
         if gap_since_cycle_ms >= cfg.gap_ms and gap_since_event_ms >= cfg.gap_ms:
-            return L1State.STILL
+            return L1State.STILL, L1Reason.STILL_GAP_TIMEOUT
         
-        # Low activity → STILL
+        # 2) Low activity, no displacement → STILL
         if activity_score < cfg.activity_threshold_low and disp_score < cfg.displacement_threshold:
-            return L1State.STILL
+            return L1State.STILL, L1Reason.STILL_LOW_ACTIVITY
         
-        # Displacement gate
+        # 3) Displacement gate
         has_displacement = disp_score >= cfg.displacement_threshold
         
         if has_displacement:
             # Check direction stability
-            direction_stable = (
-                self._direction_conf >= cfg.direction_conf_threshold or
-                self._lock_state in cfg.lock_states_for_moving
-            )
-            return L1State.MOVING if direction_stable else L1State.DISPLACEMENT
+            if self._lock_state in cfg.lock_states_for_moving:
+                return L1State.MOVING, L1Reason.MOVING_LOCKED
+            elif self._direction_conf >= cfg.direction_conf_threshold:
+                return L1State.MOVING, L1Reason.MOVING_STABLE_DIR
+            else:
+                return L1State.DISPLACEMENT, L1Reason.DISP_ABOVE_D0
         
-        # Alleen activiteit, geen displacement
+        # 4) Activity only (no displacement)
         if activity_score >= cfg.activity_threshold_high:
-            return L1State.SCRAPE
+            return L1State.SCRAPE, L1Reason.SCRAPE_HIGH_ACTIVITY
         elif activity_score >= cfg.activity_threshold_low:
-            return L1State.FEELING
+            return L1State.FEELING, L1Reason.FEELING_ACTIVITY_NO_DISP
         
-        return L1State.STILL
+        return L1State.STILL, L1Reason.STILL_LOW_ACTIVITY
     
     def _hard_reset(self):
-        """Hard reset na lange stilte (Patch B2)."""
+        """Hard reset (Patch B2)."""
         self._state = L1State.STILL
         self._encoder_conf = 0.0
         self._activity_score = 0.0
         self._events_without_cycles = 0
-        # θ̂ behouden (fysieke positie blijft)
     
     def reset(self):
-        """Volledige reset."""
+        """Full reset."""
         self._state = L1State.STILL
+        self._reason = L1Reason.INIT
         self._theta_hat_rot = 0.0
         self._prev_theta_hat_rot = 0.0
         self._t_last_update = None

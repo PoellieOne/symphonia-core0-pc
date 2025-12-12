@@ -3,17 +3,17 @@
 """
 live_symphonia_v2_0.py — Live ESP32 met L1 Encoder-Aware + L2 RealtimePipeline
 
-S02.HandEncoder-Awareness v0.1 — Patch A/B/C implementatie.
+S02.HandEncoder-Observability v0.4 — Patch D1/D3 implementatie.
 
-Changelog v2.0.3:
-- PATCH A: L1 θ̂ komt uit cycles_physical_total (niet rotations)
-- PATCH B: L1 encoder_conf decays, hard reset na stilte
-- PATCH C: Idle tick (50ms) zodat L1 kan resetten zonder events
-- OBSERVABILITY: Log bevat events_this_batch, cycles_physical_total, dt_s
+Changelog v2.0.4:
+- PATCH D1: Hard truth fields (delta_cycles, theta_deg, dt_since_event/cycle)
+- PATCH D1: Scoreboard one-liner per tick
+- PATCH D3: L2 debug passthrough tap (l2_extra in log)
+- Alle v0.3 patches behouden (A/B/C)
 
-Gebruik:
-    python3 live_symphonia_v2_0.py [--port /dev/ttyUSB0] [--profile bench_tolerant]
-    python3 live_symphonia_v2_0.py --gap-ms 500 --log
+Observability:
+- Elke log regel bevat: events, cycles, Δcycles, Δθ°, dtE, dtC, reason
+- Live scoreboard toont precies waarom L1 in bepaalde state is
 """
 
 import os
@@ -158,6 +158,7 @@ try:
         L1Config,
         L1State,
         L1Snapshot,
+        L1Reason,
     )
 except ImportError:
     try:
@@ -166,6 +167,7 @@ except ImportError:
             L1Config,
             L1State,
             L1Snapshot,
+            L1Reason,
         )
     except ImportError:
         raise ImportError(
@@ -190,7 +192,7 @@ class TerminalUI:
     DIM = "\033[2m"
     BLUE = "\033[94m"
     
-    def __init__(self, num_lines=18):
+    def __init__(self, num_lines=20):
         self.num_lines = num_lines
         self.initialized = False
         
@@ -216,48 +218,52 @@ class TerminalUI:
 def format_display(
     l1_snap: L1Snapshot,
     l2_snap: dict,
+    dt_since_event_s: float,
+    dt_since_cycle_s: float,
     events_per_sec: float,
     elapsed: float,
 ) -> list:
-    """Format L1 + L2 state voor terminal display."""
+    """Format display met hard truth fields (Patch D1)."""
     ui = TerminalUI
     lines = []
     
     # Header
     lines.append(f"{ui.BOLD}═══════════════════════════════════════════════════════════════{ui.RESET}")
-    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0.3 — L1 Encoder-Aware + Decay{ui.RESET}")
+    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0.4 — Observability{ui.RESET}")
     lines.append(f"═══════════════════════════════════════════════════════════════")
     
-    # L1 State
+    # L1 State + Reason (Patch D2)
     l1_state_str = l1_snap.state.value
+    reason_str = l1_snap.reason.value if hasattr(l1_snap.reason, 'value') else str(l1_snap.reason)
     
     state_colors = {
-        "STILL": ui.DIM,
-        "FEELING": ui.BLUE,
-        "SCRAPE": ui.YELLOW,
-        "DISPLACEMENT": ui.MAGENTA,
-        "MOVING": ui.GREEN,
+        "STILL": ui.DIM, "FEELING": ui.BLUE, "SCRAPE": ui.YELLOW,
+        "DISPLACEMENT": ui.MAGENTA, "MOVING": ui.GREEN,
     }
     state_icons = {
-        "STILL": "○",
-        "FEELING": "◐",
-        "SCRAPE": "◎",
-        "DISPLACEMENT": "◑",
-        "MOVING": "◉",
+        "STILL": "○", "FEELING": "◐", "SCRAPE": "◎",
+        "DISPLACEMENT": "◑", "MOVING": "◉",
     }
     
     l1_color = state_colors.get(l1_state_str, ui.RESET)
     l1_icon = state_icons.get(l1_state_str, "?")
     
+    lines.append(f"  {ui.BOLD}L1:{ui.RESET} {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET} reason={ui.DIM}{reason_str}{ui.RESET}")
+    
+    # θ̂ in degrees (Patch D1)
+    lines.append(f"  θ̂:  {l1_snap.theta_hat_deg:7.1f}°    Δθ̂: {l1_snap.delta_theta_deg:+6.1f}°")
+    lines.append(f"  act: {l1_snap.activity_score:7.2f}     disp: {l1_snap.disp_score:.5f}")
+    
     # Encoder conf bar
     conf_bar_len = 20
     conf_filled = int(l1_snap.encoder_conf * conf_bar_len)
     conf_bar = "█" * conf_filled + "░" * (conf_bar_len - conf_filled)
+    lines.append(f"  conf:[{conf_bar}] {l1_snap.encoder_conf:.2f}")
     
-    lines.append(f"  {ui.BOLD}L1 State:{ui.RESET}     {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET}")
-    lines.append(f"  θ̂:           {l1_snap.theta_hat_rot:+8.4f} rot   Δθ̂: {l1_snap.delta_theta_rot:+.5f}")
-    lines.append(f"  Activity:    {l1_snap.activity_score:8.2f}       Disp: {l1_snap.disp_score:.5f}")
-    lines.append(f"  Enc Conf:    [{conf_bar}] {l1_snap.encoder_conf:.2f}")
+    lines.append(f"───────────────────────────────────────────────────────────────")
+    
+    # Time gaps (Patch D1: hard truth)
+    lines.append(f"  {ui.BOLD}Gaps:{ui.RESET} dtE={dt_since_event_s:.2f}s  dtC={dt_since_cycle_s:.2f}s  Δcy={l1_snap.delta_cycles:+.0f}")
     
     lines.append(f"───────────────────────────────────────────────────────────────")
     
@@ -265,28 +271,36 @@ def format_display(
     rotor = l2_snap.get("rotor_state", "STILL")
     lock = l2_snap.get("direction_lock_state", "UNLOCKED")
     direction = l2_snap.get("direction_global_effective", "UNDECIDED")
+    rpm = l2_snap.get("rpm_est", 0)
     
     rotor_color = ui.GREEN if rotor == "MOVEMENT" else ui.DIM
     lock_color = ui.GREEN if lock == "LOCKED" else (ui.YELLOW if lock == "SOFT_LOCK" else ui.DIM)
     dir_color = ui.CYAN if direction in ("CW", "CCW") else ui.DIM
     
-    lines.append(f"  {ui.BOLD}L2 Awareness:{ui.RESET} {rotor_color}{rotor:<12}{ui.RESET}")
-    lines.append(f"  └─ Lock:       {lock_color}{lock:<12}{ui.RESET}")
-    lines.append(f"     └─ Dir:     {dir_color}{direction:<12}{ui.RESET}")
+    lines.append(f"  {ui.BOLD}L2:{ui.RESET} {rotor_color}{rotor:<10}{ui.RESET} {lock_color}{lock:<10}{ui.RESET} {dir_color}{direction:<8}{ui.RESET}")
+    
+    # L2 metrics
+    compass = l2_snap.get("compass_snapshot")
+    score = compass.global_score if compass else 0
+    cycles_total = l2_snap.get("total_cycles_physical", 0)
+    
+    lines.append(f"  rpm: {rpm:6.1f}  score: {score:+.3f}  cycles: {cycles_total:.0f}")
     
     lines.append(f"───────────────────────────────────────────────────────────────")
     
-    # Metrics
-    cycles_total = l2_snap.get("total_cycles_physical", 0)
-    rpm = l2_snap.get("rpm_est", 0)
-    compass = l2_snap.get("compass_snapshot")
-    score = compass.global_score if compass else 0
-    
-    lines.append(f"  Cycles:     {cycles_total:8.0f}       dt: {l1_snap.dt_s*1000:.0f}ms")
-    lines.append(f"  RPM:        {rpm:8.1f}       Score: {score:+.3f}")
-    lines.append(f"  Events/s:   {events_per_sec:8.1f}       Tijd: {elapsed:.1f}s")
+    # Stats
+    lines.append(f"  Events/s: {events_per_sec:6.1f}    Tijd: {elapsed:.1f}s")
     
     lines.append(f"═══════════════════════════════════════════════════════════════")
+    
+    # Scoreboard one-liner (Patch D1.2)
+    scoreboard = (
+        f"L1 {l1_state_str:12} act={l1_snap.activity_score:5.1f} "
+        f"dθ={l1_snap.delta_theta_deg:+5.1f}° conf={l1_snap.encoder_conf:.2f} | "
+        f"L2 {rotor}/{lock} Δcy={l1_snap.delta_cycles:+.0f} "
+        f"dtE={dt_since_event_s:.2f}s dtC={dt_since_cycle_s:.2f}s"
+    )
+    lines.append(f"{ui.DIM}{scoreboard}{ui.RESET}")
     
     return lines
 
@@ -295,7 +309,7 @@ def format_display(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Live ESP32 met L1 Encoder-Aware (Patch A/B/C)'
+        description='Live ESP32 met L1 Encoder-Aware (Observability v0.4)'
     )
     parser.add_argument('--port', '-p', default='/dev/ttyUSB0')
     parser.add_argument('--baud', '-b', type=int, default=115200)
@@ -303,15 +317,14 @@ def main():
                        default='bench_tolerant')
     parser.add_argument('--gap-ms', type=float, default=500.0)
     parser.add_argument('--disp-threshold', type=float, default=0.005)
-    parser.add_argument('--encoder-tau', type=float, default=0.6,
-                       help='Encoder conf decay tau (seconds)')
-    parser.add_argument('--hard-reset', type=float, default=1.5,
-                       help='Hard reset timeout (seconds)')
-    parser.add_argument('--tick-ms', type=float, default=50.0,
-                       help='Idle tick interval (Patch C)')
+    parser.add_argument('--encoder-tau', type=float, default=0.6)
+    parser.add_argument('--hard-reset', type=float, default=1.5)
+    parser.add_argument('--tick-ms', type=float, default=50.0)
     parser.add_argument('--min-normal-tile', type=int, default=2)
     parser.add_argument('--log', '-l', action='store_true')
     parser.add_argument('--simple', '-s', action='store_true')
+    parser.add_argument('--scoreboard', action='store_true',
+                       help='Print scoreboard line per tick')
     
     args = parser.parse_args()
     
@@ -320,7 +333,6 @@ def main():
         import serial
     except ImportError:
         print("❌ pyserial niet geïnstalleerd!")
-        print("   pip install pyserial")
         return 1
     
     # Import L2 pipeline
@@ -356,7 +368,7 @@ def main():
     else:
         l2_profile = PROFILE_PRODUCTION
     
-    # Create L1 config (v0.3 met decay)
+    # Create L1 config
     l1_config = L1Config(
         gap_ms=args.gap_ms,
         displacement_threshold=args.disp_threshold,
@@ -372,7 +384,7 @@ def main():
     # Open serial
     print(f"[i] Opening {args.port} @ {args.baud}...")
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.01)  # Kort timeout voor idle tick!
+        ser = serial.Serial(args.port, args.baud, timeout=0.01)
     except Exception as e:
         print(f"❌ {e}")
         return 1
@@ -391,11 +403,10 @@ def main():
         print(f"[i] Logging to: {log_path}")
     
     # Setup UI
-    ui = None if args.simple else TerminalUI(num_lines=18)
+    ui = None if args.simple or args.scoreboard else TerminalUI(num_lines=20)
     
     print(f"[i] L2 Profile: {l2_profile.name}")
-    print(f"[i] L1 Config: gap={args.gap_ms}ms, disp={args.disp_threshold}, tau={args.encoder_tau}s")
-    print(f"[i] Patch C: idle tick every {args.tick_ms}ms")
+    print(f"[i] L1: gap={args.gap_ms}ms, D0={args.disp_threshold}, tau={args.encoder_tau}s")
     print(f"[i] Listening... (Ctrl+C to stop)")
     print()
     
@@ -405,13 +416,18 @@ def main():
     # State
     t0 = time.time()
     last_display = time.time()
-    last_tick = time.time()  # Patch C
+    last_tick = time.time()
     tick_interval_s = args.tick_ms / 1000.0
     
     events_window = deque(maxlen=100)
     total_events = 0
     
-    l1_snap = L1Snapshot(state=L1State.STILL)
+    # Hard truth trackers (Patch D1)
+    dt_since_last_event_s = 0.0
+    dt_since_last_cycle_s = 0.0
+    prev_cycles_physical_total = 0.0
+    
+    l1_snap = L1Snapshot(state=L1State.STILL, reason=L1Reason.INIT)
     l2_snap = {}
     cycles_physical_total = 0.0
     
@@ -440,25 +456,31 @@ def main():
                 l2_result = l2_pipeline.feed_event(ev)
                 l2_snap = l2_result.movement_state
                 l2_snap["compass_snapshot"] = l2_result.compass_snapshot
-                
-                # Track cycles (Patch A: bron voor θ̂)
                 cycles_physical_total = l2_snap.get("total_cycles_physical", 0)
             
-            # === PATCH C: Idle tick ===
-            # Update L1 elke tick, ook zonder events
+            # === PATCH D1: Hard truth time gaps ===
+            delta_cycles_physical = cycles_physical_total - prev_cycles_physical_total
+            
+            if events_this_batch > 0:
+                dt_since_last_event_s = 0.0
+            else:
+                dt_since_last_event_s += tick_interval_s
+            
+            if delta_cycles_physical > 0:
+                dt_since_last_cycle_s = 0.0
+                prev_cycles_physical_total = cycles_physical_total
+            else:
+                dt_since_last_cycle_s += tick_interval_s
+            
+            # === Update L1 (Patch C: idle tick) ===
             if now - last_tick >= tick_interval_s or events_this_batch > 0:
                 last_tick = now
                 
-                # Direction confidence
                 compass_snap = l2_snap.get("compass_snapshot")
-                direction_conf = 0.0
-                if compass_snap:
-                    direction_conf = abs(getattr(compass_snap, 'global_score', 0.0))
-                
+                direction_conf = abs(getattr(compass_snap, 'global_score', 0.0)) if compass_snap else 0.0
                 lock_state = l2_snap.get("direction_lock_state", "UNLOCKED")
                 direction_effective = l2_snap.get("direction_global_effective", "UNDECIDED")
                 
-                # Update L1 (Patch A: cycles_physical_total als θ̂ bron)
                 l1_snap = l1_activity.update(
                     wall_time=now,
                     cycles_physical_total=cycles_physical_total,
@@ -468,17 +490,35 @@ def main():
                     direction_effective=direction_effective,
                 )
                 
-                # Log (enhanced observability)
+                # === PATCH D3: L2 debug passthrough tap ===
+                l2_extra_keys = [
+                    "rpm_est", "rotations", "direction_conf",
+                    "compass_score", "cadence_ok", "cycle_index",
+                    "tiles_emitted_n", "cycles_emitted_n",
+                    "total_cycles_physical", "cycles_claimed_at_lock",
+                ]
+                l2_extra = {k: l2_snap[k] for k in l2_extra_keys if k in l2_snap}
+                
+                # Also extract compass fields if available
+                if compass_snap:
+                    l2_extra["compass_global_score"] = getattr(compass_snap, 'global_score', None)
+                    l2_extra["compass_confidence"] = getattr(compass_snap, 'confidence', None)
+                
+                # === Log (Patch D1 + D3) ===
                 if log_file:
                     log_entry = {
-                        "t": round(now - t0, 4),
+                        "t_abs_s": round(now - t0, 4),
                         "dt_s": round(l1_snap.dt_s, 4),
                         "events_this_batch": events_this_batch,
                         "cycles_physical_total": cycles_physical_total,
+                        "delta_cycles_physical": delta_cycles_physical,
+                        "dt_since_last_event_s": round(dt_since_last_event_s, 3),
+                        "dt_since_last_cycle_s": round(dt_since_last_cycle_s, 3),
                         "l1": {
                             "state": l1_snap.state.value,
-                            "theta_hat_rot": round(l1_snap.theta_hat_rot, 5),
-                            "delta_theta_rot": round(l1_snap.delta_theta_rot, 6),
+                            "reason": l1_snap.reason.value,
+                            "theta_hat_deg": round(l1_snap.theta_hat_deg, 2),
+                            "delta_theta_deg": round(l1_snap.delta_theta_deg, 2),
                             "activity_score": round(l1_snap.activity_score, 2),
                             "disp_score": round(l1_snap.disp_score, 6),
                             "encoder_conf": round(l1_snap.encoder_conf, 3),
@@ -487,27 +527,51 @@ def main():
                             "rotor_state": l2_snap.get("rotor_state", "STILL"),
                             "lock_state": lock_state,
                             "direction": direction_effective,
-                        }
+                        },
+                        "l2_extra": l2_extra,
                     }
                     log_file.write(json.dumps(log_entry) + "\n")
+                
+                # === Scoreboard mode (Patch D1.2) ===
+                if args.scoreboard:
+                    rpm = l2_snap.get("rpm_est", 0)
+                    rotor = l2_snap.get("rotor_state", "STILL")
+                    rpm_str = f"rpm={rpm:.0f}" if rpm else ""
+                    
+                    line = (
+                        f"L1 {l1_snap.state.value:12} act={l1_snap.activity_score:5.1f} "
+                        f"dθ={l1_snap.delta_theta_deg:+6.1f}° conf={l1_snap.encoder_conf:.2f} | "
+                        f"L2 {rotor}/{lock_state} dir={direction_effective} {rpm_str} "
+                        f"Δcy={delta_cycles_physical:+.0f} "
+                        f"dtE={dt_since_last_event_s:.2f}s dtC={dt_since_last_cycle_s:.2f}s"
+                    )
+                    print(line)
             
             # Update display
-            if now - last_display > 0.1:
+            if ui and now - last_display > 0.1:
                 elapsed = now - t0
                 recent = [t for t in events_window if now - t < 1.0]
                 events_per_sec = len(recent)
                 
-                if ui:
-                    lines = format_display(l1_snap, l2_snap, events_per_sec, elapsed)
-                    ui.update(lines)
-                elif args.simple:
-                    print(f"\r[{elapsed:6.1f}s] L1:{l1_snap.state.value:12} "
-                          f"θ̂={l1_snap.theta_hat_rot:+.3f} "
-                          f"conf={l1_snap.encoder_conf:.2f} "
-                          f"act={l1_snap.activity_score:.1f} | "
-                          f"cy={cycles_physical_total:.0f} ev/s={events_per_sec:3.0f}   ",
-                          end='', flush=True)
+                lines = format_display(
+                    l1_snap, l2_snap,
+                    dt_since_last_event_s, dt_since_last_cycle_s,
+                    events_per_sec, elapsed
+                )
+                ui.update(lines)
+                last_display = now
+            
+            elif args.simple and now - last_display > 0.1:
+                elapsed = now - t0
+                recent = [t for t in events_window if now - t < 1.0]
+                events_per_sec = len(recent)
                 
+                print(f"\r[{elapsed:6.1f}s] L1:{l1_snap.state.value:12} "
+                      f"θ̂={l1_snap.theta_hat_deg:5.1f}° Δθ={l1_snap.delta_theta_deg:+5.1f}° "
+                      f"conf={l1_snap.encoder_conf:.2f} "
+                      f"Δcy={delta_cycles_physical:+.0f} dtC={dt_since_last_cycle_s:.1f}s | "
+                      f"ev/s={events_per_sec:3.0f}   ",
+                      end='', flush=True)
                 last_display = now
     
     except KeyboardInterrupt:
@@ -530,14 +594,18 @@ def main():
         print(f"  Total events:    {total_events}")
         print(f"  Total cycles:    {cycles_physical_total:.0f}")
         print()
-        print(f"  L1 Final:        {l1_snap.state.value}")
-        print(f"  L1 θ̂:            {l1_snap.theta_hat_rot:.4f} rot")
+        print(f"  L1 Final:        {l1_snap.state.value} ({l1_snap.reason.value})")
+        print(f"  L1 θ̂:            {l1_snap.theta_hat_deg:.1f}°")
         print(f"  L1 Encoder Conf: {l1_snap.encoder_conf:.3f}")
         print()
         final_l2 = l2_pipeline.snapshot().movement_state
         print(f"  L2 Final:        {final_l2.get('rotor_state', 'STILL')} / "
               f"{final_l2.get('direction_lock_state', 'UNLOCKED')}")
         print("=" * 65)
+        
+        if args.log:
+            print(f"\n[i] Log: live_encoder_*.jsonl")
+            print(f"[i] Analyze: python3 analyze_handencoder_log.py <logfile>")
     
     return 0
 
