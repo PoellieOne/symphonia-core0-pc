@@ -3,17 +3,17 @@
 """
 live_symphonia_v2_0.py — Live ESP32 met L1 Encoder-Aware + L2 RealtimePipeline
 
-S02.HandEncoder-Observability v0.4 — Patch D1/D3 implementatie.
+S02.HandEncoder-Observability v2.0.5 — Patch P1/P2/P3
 
-Changelog v2.0.4:
-- PATCH D1: Hard truth fields (delta_cycles, theta_deg, dt_since_event/cycle)
-- PATCH D1: Scoreboard one-liner per tick
-- PATCH D3: L2 debug passthrough tap (l2_extra in log)
-- Alle v0.3 patches behouden (A/B/C)
+Changelog v2.0.5:
+- PATCH P1: Signed angle deltas [-180°, +180°) - geen wrap artifacts
+- PATCH P2: dt_since_* correct init en clamp (nooit > session_elapsed)
+- PATCH P3: Extra diagnosevelden in jsonl (theta_hat_rot, delta_theta_deg_raw/signed)
+- Scoreboard toont alleen signed Δθ
 
-Observability:
-- Elke log regel bevat: events, cycles, Δcycles, Δθ°, dtE, dtC, reason
-- Live scoreboard toont precies waarom L1 in bepaalde state is
+Gebruik:
+    python3 live_symphonia_v2_0.py [--port /dev/ttyUSB0] --log
+    python3 live_symphonia_v2_0.py --scoreboard
 """
 
 import os
@@ -49,6 +49,17 @@ if PROJECT_ROOT is None:
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# === PATCH P1: Signed angle helper ===================================
+
+def wrap_deg_signed(x: float) -> float:
+    """
+    Wrap angle to [-180°, +180°).
+    
+    Patch P1.1: Voorkomt "+345°" artifacts → toont als "-15°".
+    """
+    return ((x + 180.0) % 360.0) - 180.0
 
 
 # === BINLINK (inline) ========================================================
@@ -154,20 +165,12 @@ def decode_flags(flags0, flags1):
 
 try:
     from sym_cycles.l1_physical_activity import (
-        L1PhysicalActivity,
-        L1Config,
-        L1State,
-        L1Snapshot,
-        L1Reason,
+        L1PhysicalActivity, L1Config, L1State, L1Snapshot, L1Reason,
     )
 except ImportError:
     try:
         from l1_physical_activity import (
-            L1PhysicalActivity,
-            L1Config,
-            L1State,
-            L1Snapshot,
-            L1Reason,
+            L1PhysicalActivity, L1Config, L1State, L1Snapshot, L1Reason,
         )
     except ImportError:
         raise ImportError(
@@ -218,21 +221,21 @@ class TerminalUI:
 def format_display(
     l1_snap: L1Snapshot,
     l2_snap: dict,
+    delta_theta_deg_signed: float,
     dt_since_event_s: float,
     dt_since_cycle_s: float,
     events_per_sec: float,
     elapsed: float,
 ) -> list:
-    """Format display met hard truth fields (Patch D1)."""
+    """Format display met signed angles (Patch P1)."""
     ui = TerminalUI
     lines = []
     
-    # Header
     lines.append(f"{ui.BOLD}═══════════════════════════════════════════════════════════════{ui.RESET}")
-    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0.4 — Observability{ui.RESET}")
+    lines.append(f"{ui.BOLD}  SYMPHONIA v2.0.5 — Signed Observability{ui.RESET}")
     lines.append(f"═══════════════════════════════════════════════════════════════")
     
-    # L1 State + Reason (Patch D2)
+    # L1 State + Reason
     l1_state_str = l1_snap.state.value
     reason_str = l1_snap.reason.value if hasattr(l1_snap.reason, 'value') else str(l1_snap.reason)
     
@@ -248,10 +251,10 @@ def format_display(
     l1_color = state_colors.get(l1_state_str, ui.RESET)
     l1_icon = state_icons.get(l1_state_str, "?")
     
-    lines.append(f"  {ui.BOLD}L1:{ui.RESET} {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET} reason={ui.DIM}{reason_str}{ui.RESET}")
+    lines.append(f"  {ui.BOLD}L1:{ui.RESET} {l1_color}{l1_icon} {l1_state_str:<12}{ui.RESET} {ui.DIM}{reason_str}{ui.RESET}")
     
-    # θ̂ in degrees (Patch D1)
-    lines.append(f"  θ̂:  {l1_snap.theta_hat_deg:7.1f}°    Δθ̂: {l1_snap.delta_theta_deg:+6.1f}°")
+    # θ̂ - Patch P1: toon SIGNED delta
+    lines.append(f"  θ̂:  {l1_snap.theta_hat_deg:7.1f}°    Δθ: {delta_theta_deg_signed:+6.1f}° (signed)")
     lines.append(f"  act: {l1_snap.activity_score:7.2f}     disp: {l1_snap.disp_score:.5f}")
     
     # Encoder conf bar
@@ -262,7 +265,7 @@ def format_display(
     
     lines.append(f"───────────────────────────────────────────────────────────────")
     
-    # Time gaps (Patch D1: hard truth)
+    # Time gaps (Patch P2: clamped)
     lines.append(f"  {ui.BOLD}Gaps:{ui.RESET} dtE={dt_since_event_s:.2f}s  dtC={dt_since_cycle_s:.2f}s  Δcy={l1_snap.delta_cycles:+.0f}")
     
     lines.append(f"───────────────────────────────────────────────────────────────")
@@ -279,7 +282,6 @@ def format_display(
     
     lines.append(f"  {ui.BOLD}L2:{ui.RESET} {rotor_color}{rotor:<10}{ui.RESET} {lock_color}{lock:<10}{ui.RESET} {dir_color}{direction:<8}{ui.RESET}")
     
-    # L2 metrics
     compass = l2_snap.get("compass_snapshot")
     score = compass.global_score if compass else 0
     cycles_total = l2_snap.get("total_cycles_physical", 0)
@@ -287,16 +289,13 @@ def format_display(
     lines.append(f"  rpm: {rpm:6.1f}  score: {score:+.3f}  cycles: {cycles_total:.0f}")
     
     lines.append(f"───────────────────────────────────────────────────────────────")
-    
-    # Stats
     lines.append(f"  Events/s: {events_per_sec:6.1f}    Tijd: {elapsed:.1f}s")
-    
     lines.append(f"═══════════════════════════════════════════════════════════════")
     
-    # Scoreboard one-liner (Patch D1.2)
+    # Scoreboard one-liner (Patch P1: signed only)
     scoreboard = (
         f"L1 {l1_state_str:12} act={l1_snap.activity_score:5.1f} "
-        f"dθ={l1_snap.delta_theta_deg:+5.1f}° conf={l1_snap.encoder_conf:.2f} | "
+        f"Δθ={delta_theta_deg_signed:+5.1f}° conf={l1_snap.encoder_conf:.2f} | "
         f"L2 {rotor}/{lock} Δcy={l1_snap.delta_cycles:+.0f} "
         f"dtE={dt_since_event_s:.2f}s dtC={dt_since_cycle_s:.2f}s"
     )
@@ -309,7 +308,7 @@ def format_display(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Live ESP32 met L1 Encoder-Aware (Observability v0.4)'
+        description='Live ESP32 met L1 Encoder-Aware (Observability v2.0.5)'
     )
     parser.add_argument('--port', '-p', default='/dev/ttyUSB0')
     parser.add_argument('--baud', '-b', type=int, default=115200)
@@ -323,19 +322,17 @@ def main():
     parser.add_argument('--min-normal-tile', type=int, default=2)
     parser.add_argument('--log', '-l', action='store_true')
     parser.add_argument('--simple', '-s', action='store_true')
-    parser.add_argument('--scoreboard', action='store_true',
-                       help='Print scoreboard line per tick')
+    parser.add_argument('--scoreboard', action='store_true')
     
     args = parser.parse_args()
     
-    # Import serial
     try:
         import serial
     except ImportError:
         print("❌ pyserial niet geïnstalleerd!")
         return 1
     
-    # Import L2 pipeline
+    # Import L2
     try:
         from sym_cycles.realtime_states_v1_9_canonical import (
             RealtimePipeline, PipelineProfile,
@@ -360,7 +357,7 @@ def main():
             print("❌ realtime_states_v1_9_canonical.py niet gevonden!")
             return 1
     
-    # Select L2 profile
+    # Select profile
     if args.profile == 'bench_tolerant':
         l2_profile = PROFILE_BENCH_TOLERANT
     elif args.profile == 'bench':
@@ -368,7 +365,7 @@ def main():
     else:
         l2_profile = PROFILE_PRODUCTION
     
-    # Create L1 config
+    # L1 config
     l1_config = L1Config(
         gap_ms=args.gap_ms,
         displacement_threshold=args.disp_threshold,
@@ -394,7 +391,7 @@ def main():
     l2_pipeline = RealtimePipeline(profile=l2_profile)
     l1_activity = L1PhysicalActivity(config=l1_config)
     
-    # Setup logging
+    # Logging
     log_file = None
     if args.log:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -402,29 +399,35 @@ def main():
         log_file = open(log_path, 'w')
         print(f"[i] Logging to: {log_path}")
     
-    # Setup UI
+    # UI
     ui = None if args.simple or args.scoreboard else TerminalUI(num_lines=20)
     
     print(f"[i] L2 Profile: {l2_profile.name}")
-    print(f"[i] L1: gap={args.gap_ms}ms, D0={args.disp_threshold}, tau={args.encoder_tau}s")
+    print(f"[i] L1: gap={args.gap_ms}ms, D0={args.disp_threshold}")
+    print(f"[i] Patch P1: Signed angles [-180°,+180°)")
+    print(f"[i] Patch P2: dt clamp to session_elapsed")
     print(f"[i] Listening... (Ctrl+C to stop)")
     print()
     
     if ui:
         ui.init()
     
-    # State
-    t0 = time.time()
-    last_display = time.time()
-    last_tick = time.time()
+    # === PATCH P2: Correct init ===
+    session_t0 = time.time()
+    t0 = session_t0
+    last_display = session_t0
+    last_tick = session_t0
     tick_interval_s = args.tick_ms / 1000.0
     
     events_window = deque(maxlen=100)
     total_events = 0
     
-    # Hard truth trackers (Patch D1)
+    # Patch P2: init dt's at 0
     dt_since_last_event_s = 0.0
     dt_since_last_cycle_s = 0.0
+    t_last_event = None
+    t_last_cycle = None
+    
     prev_cycles_physical_total = 0.0
     
     l1_snap = L1Snapshot(state=L1State.STILL, reason=L1Reason.INIT)
@@ -434,6 +437,7 @@ def main():
     try:
         while True:
             now = time.time()
+            session_elapsed = now - session_t0  # Patch P2
             events_this_batch = 0
             
             # Process frames
@@ -452,27 +456,39 @@ def main():
                 total_events += 1
                 events_this_batch += 1
                 
-                # Feed to L2
                 l2_result = l2_pipeline.feed_event(ev)
                 l2_snap = l2_result.movement_state
                 l2_snap["compass_snapshot"] = l2_result.compass_snapshot
                 cycles_physical_total = l2_snap.get("total_cycles_physical", 0)
             
-            # === PATCH D1: Hard truth time gaps ===
+            # === PATCH P2: dt calculations with clamp ===
             delta_cycles_physical = cycles_physical_total - prev_cycles_physical_total
             
+            # Update event timing
             if events_this_batch > 0:
-                dt_since_last_event_s = 0.0
-            else:
-                dt_since_last_event_s += tick_interval_s
+                t_last_event = now
             
+            # Update cycle timing
             if delta_cycles_physical > 0:
-                dt_since_last_cycle_s = 0.0
+                t_last_cycle = now
                 prev_cycles_physical_total = cycles_physical_total
-            else:
-                dt_since_last_cycle_s += tick_interval_s
             
-            # === Update L1 (Patch C: idle tick) ===
+            # Calculate dt's
+            if t_last_event is not None:
+                dt_since_last_event_s = now - t_last_event
+            else:
+                dt_since_last_event_s = session_elapsed
+            
+            if t_last_cycle is not None:
+                dt_since_last_cycle_s = now - t_last_cycle
+            else:
+                dt_since_last_cycle_s = session_elapsed
+            
+            # Patch P2: Clamp to session_elapsed
+            dt_since_last_event_s = min(dt_since_last_event_s, session_elapsed)
+            dt_since_last_cycle_s = min(dt_since_last_cycle_s, session_elapsed)
+            
+            # === Update L1 ===
             if now - last_tick >= tick_interval_s or events_this_batch > 0:
                 last_tick = now
                 
@@ -490,39 +506,46 @@ def main():
                     direction_effective=direction_effective,
                 )
                 
-                # === PATCH D3: L2 debug passthrough tap ===
+                # === PATCH P1: Signed angle ===
+                delta_theta_deg_raw = l1_snap.delta_theta_deg
+                delta_theta_deg_signed = wrap_deg_signed(delta_theta_deg_raw)
+                
+                # L2 extra tap
                 l2_extra_keys = [
-                    "rpm_est", "rotations", "direction_conf",
-                    "compass_score", "cadence_ok", "cycle_index",
-                    "tiles_emitted_n", "cycles_emitted_n",
-                    "total_cycles_physical", "cycles_claimed_at_lock",
+                    "rpm_est", "rotations", "total_cycles_physical",
+                    "cycles_claimed_at_lock",
                 ]
                 l2_extra = {k: l2_snap[k] for k in l2_extra_keys if k in l2_snap}
-                
-                # Also extract compass fields if available
                 if compass_snap:
                     l2_extra["compass_global_score"] = getattr(compass_snap, 'global_score', None)
-                    l2_extra["compass_confidence"] = getattr(compass_snap, 'confidence', None)
                 
-                # === Log (Patch D1 + D3) ===
+                # === PATCH P3: Full log entry ===
                 if log_file:
                     log_entry = {
-                        "t_abs_s": round(now - t0, 4),
+                        "t_abs_s": round(session_elapsed, 4),
                         "dt_s": round(l1_snap.dt_s, 4),
+                        # Events & cycles
                         "events_this_batch": events_this_batch,
                         "cycles_physical_total": cycles_physical_total,
                         "delta_cycles_physical": delta_cycles_physical,
+                        # Theta (Patch P1 + P3)
+                        "theta_hat_rot": round(l1_snap.theta_hat_rot, 5),
+                        "theta_hat_deg": round(l1_snap.theta_hat_deg, 2),
+                        "delta_theta_rot": round(l1_snap.delta_theta_rot, 6),
+                        "delta_theta_deg_raw": round(delta_theta_deg_raw, 2),
+                        "delta_theta_deg_signed": round(delta_theta_deg_signed, 2),
+                        # Time gaps (Patch P2)
                         "dt_since_last_event_s": round(dt_since_last_event_s, 3),
                         "dt_since_last_cycle_s": round(dt_since_last_cycle_s, 3),
+                        # L1 state
                         "l1": {
                             "state": l1_snap.state.value,
                             "reason": l1_snap.reason.value,
-                            "theta_hat_deg": round(l1_snap.theta_hat_deg, 2),
-                            "delta_theta_deg": round(l1_snap.delta_theta_deg, 2),
                             "activity_score": round(l1_snap.activity_score, 2),
                             "disp_score": round(l1_snap.disp_score, 6),
                             "encoder_conf": round(l1_snap.encoder_conf, 3),
                         },
+                        # L2 state
                         "l2": {
                             "rotor_state": l2_snap.get("rotor_state", "STILL"),
                             "lock_state": lock_state,
@@ -532,7 +555,7 @@ def main():
                     }
                     log_file.write(json.dumps(log_entry) + "\n")
                 
-                # === Scoreboard mode (Patch D1.2) ===
+                # === Scoreboard (Patch P1: signed only) ===
                 if args.scoreboard:
                     rpm = l2_snap.get("rpm_est", 0)
                     rotor = l2_snap.get("rotor_state", "STILL")
@@ -540,21 +563,24 @@ def main():
                     
                     line = (
                         f"L1 {l1_snap.state.value:12} act={l1_snap.activity_score:5.1f} "
-                        f"dθ={l1_snap.delta_theta_deg:+6.1f}° conf={l1_snap.encoder_conf:.2f} | "
-                        f"L2 {rotor}/{lock_state} dir={direction_effective} {rpm_str} "
+                        f"Δθ={delta_theta_deg_signed:+6.1f}° conf={l1_snap.encoder_conf:.2f} | "
+                        f"L2 {rotor}/{lock_state} {rpm_str} "
                         f"Δcy={delta_cycles_physical:+.0f} "
                         f"dtE={dt_since_last_event_s:.2f}s dtC={dt_since_last_cycle_s:.2f}s"
                     )
                     print(line)
             
-            # Update display
+            # Display update
             if ui and now - last_display > 0.1:
-                elapsed = now - t0
+                elapsed = session_elapsed
                 recent = [t for t in events_window if now - t < 1.0]
                 events_per_sec = len(recent)
                 
+                delta_theta_deg_signed = wrap_deg_signed(l1_snap.delta_theta_deg)
+                
                 lines = format_display(
                     l1_snap, l2_snap,
+                    delta_theta_deg_signed,
                     dt_since_last_event_s, dt_since_last_cycle_s,
                     events_per_sec, elapsed
                 )
@@ -562,12 +588,13 @@ def main():
                 last_display = now
             
             elif args.simple and now - last_display > 0.1:
-                elapsed = now - t0
+                elapsed = session_elapsed
                 recent = [t for t in events_window if now - t < 1.0]
                 events_per_sec = len(recent)
+                delta_theta_deg_signed = wrap_deg_signed(l1_snap.delta_theta_deg)
                 
                 print(f"\r[{elapsed:6.1f}s] L1:{l1_snap.state.value:12} "
-                      f"θ̂={l1_snap.theta_hat_deg:5.1f}° Δθ={l1_snap.delta_theta_deg:+5.1f}° "
+                      f"θ̂={l1_snap.theta_hat_deg:5.1f}° Δθ={delta_theta_deg_signed:+5.1f}° "
                       f"conf={l1_snap.encoder_conf:.2f} "
                       f"Δcy={delta_cycles_physical:+.0f} dtC={dt_since_last_cycle_s:.1f}s | "
                       f"ev/s={events_per_sec:3.0f}   ",
@@ -584,8 +611,7 @@ def main():
         if log_file:
             log_file.close()
         
-        # Summary
-        elapsed = time.time() - t0
+        elapsed = time.time() - session_t0
         print()
         print("=" * 65)
         print("SESSION SUMMARY")
