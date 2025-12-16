@@ -1,398 +1,183 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-analyze_handencoder_log.py — Offline analyzer voor handencoder logs
+analyze_handencoder_log.py — V4.7b Canonical Cycle Truth Analyzer
 
-S02.HandEncoder-Observability v2.0.5 — Patch P1/P2/P3/P4
+Analyzes JSONL logs from live_symphonia for:
+- MDI modes A/B/C performance
+- Canonical cycle truth (total_cycles_physical from v1.9)
+- Origin readiness diagnosis
 
-Changelog v2:
-- PATCH P1: Signed angles [-180°, +180°) in alle output
-- PATCH P2: dt_since_* clamp bij analyse (max = run duration)
-- PATCH P3: delta_cycles histogram, scrape-without-displacement score
-- PATCH P4: UX: interpretatieregels, betere FIRST DISPLACEMENT output
-
-Gebruik:
-    python3 analyze_handencoder_log.py live_encoder_*.jsonl
-    python3 analyze_handencoder_log.py *.jsonl --summary
+Changelog v0.4.7b:
+- Based on v1.9 canonical analysis
+- total_cycles_physical is the canonical source
 """
-
-import sys
-import json
-import argparse
+import json, sys
 from pathlib import Path
-from collections import defaultdict, Counter
-from typing import List, Dict, Any, Optional
+from collections import Counter
+INF = float('inf')
 
+def load_jsonl(p):
+    with open(p) as f: return [json.loads(l) for l in f if l.strip()]
 
-# === PATCH P1: Signed angle helper ===
-
-def wrap_deg_signed(x: float) -> float:
-    """Wrap angle to [-180°, +180°)."""
-    return ((x + 180.0) % 360.0) - 180.0
-
-
-def load_log(filepath: str) -> List[Dict[str, Any]]:
-    """Load JSONL log file."""
-    records = []
-    with open(filepath, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-    return records
-
-
-def analyze_log(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Analyze log records with signed angles and clamped dt's."""
-    if not records:
-        return {"error": "No records"}
+def analyze(records):
+    if not records: return {"error": "empty"}
+    n = len(records)
+    dur = records[-1].get("t_s", 0) - records[0].get("t_s", 0) if n > 1 else 0
+    total_ev = sum(r.get("ev", 0) for r in records)
     
-    results = {
-        "total_records": len(records),
-        "duration_s": 0,
-        "first_displacement": None,
-        "total_cycles": 0,
-        "total_events": 0,
-        "delta_theta_histogram_signed": defaultdict(int),
-        "delta_cycles_histogram": defaultdict(int),
-        "top_delta_theta": [],
-        "scrape_segments": [],
-        "scrape_without_disp_fraction": 0.0,
-        "direction_flips": [],
-        "state_counts": Counter(),
-        "reason_counts": Counter(),
+    # Timeline
+    first_pre_mov = first_cand = first_comm = first_mov = first_micro_t0 = None
+    latch_count = latch_dropped = latch_confirmed = 0
+    aw_states, aw_reasons = Counter(), Counter()
+    ev_wins = []
+    max_mdi_disp = 0
+    mdi_mode = "C"
+    
+    # Canonical cycle truth
+    final_total_cycles = 0.0
+    final_cb_total = 0
+    max_total_cycles = 0.0
+    max_cb_total = 0
+    mismatches = 0
+    cycles_source_key = "total_cycles_physical"
+    
+    for r in records:
+        t = r.get("t_s", 0)
+        aw = r.get("aw", {})
+        state, reason = aw.get("state", "?"), aw.get("reason", "?")
+        aw_states[state] += 1
+        aw_reasons[reason] += 1
+        
+        mdi = r.get("mdi", {})
+        if "mode" in mdi: mdi_mode = mdi["mode"]
+        ev_win = mdi.get("ev_win", 0)
+        if ev_win > 0: ev_wins.append(ev_win)
+        mdi_disp = mdi.get("disp_deg", 0)
+        if mdi_disp > max_mdi_disp: max_mdi_disp = mdi_disp
+        mt0 = mdi.get("t0")
+        if mt0 and first_micro_t0 is None: first_micro_t0 = mt0
+        
+        if mdi.get("latch_set") and mdi.get("confirmed"): latch_confirmed += 1
+        if reason == "MDI_LATCH": latch_count += 1
+        if reason == "MDI_LATCH_DROPPED": latch_dropped += 1
+        
+        if state == "PRE_MOVEMENT" and first_pre_mov is None: first_pre_mov = t
+        cand = r.get("candidate", {})
+        comm = r.get("commit", {})
+        if cand.get("set") and first_cand is None: first_cand = t
+        if comm.get("set") and first_comm is None: first_comm = t
+        if state == "MOVEMENT" and first_mov is None: first_mov = t
+        
+        # Cycle truth
+        ct = r.get("_cycle_truth", {})
+        if ct:
+            used = ct.get("used_total", 0)
+            cb = ct.get("cb_total", 0)
+            final_total_cycles = used
+            final_cb_total = cb
+            max_total_cycles = max(max_total_cycles, used)
+            max_cb_total = max(max_cb_total, cb)
+            if ct.get("mismatch"): mismatches += 1
+            if ct.get("source_key"): cycles_source_key = ct["source_key"]
+        
+        # L2 direct
+        l2 = r.get("l2", {})
+        if l2.get("total_cycles_physical"):
+            final_total_cycles = max(final_total_cycles, l2["total_cycles_physical"])
+    
+    ev_stats = {"min": min(ev_wins), "median": sorted(ev_wins)[len(ev_wins)//2], "max": max(ev_wins)} if ev_wins else {}
+    
+    return {
+        "n_records": n, "duration_s": dur, "total_events": total_ev,
+        "mdi_mode": mdi_mode,
+        "timeline": {"first_micro_t0_s": first_micro_t0, "first_pre_movement_s": first_pre_mov,
+                     "first_candidate_s": first_cand, "first_commit_s": first_comm, "first_movement_s": first_mov},
+        "mdi": {"max_disp_deg": max_mdi_disp, "ev_win_stats": ev_stats},
+        "latch": {"episodes": latch_count, "dropped": latch_dropped, "confirmed": latch_confirmed},
+        "aw_states": dict(aw_states), "aw_reasons": dict(aw_reasons),
+        "cycle_truth": {
+            "total_cycles_physical_final": final_total_cycles,
+            "cb_total_final": final_cb_total,
+            "total_cycles_physical_max": max_total_cycles,
+            "cb_total_max": max_cb_total,
+            "mismatches_logged": mismatches,
+            "source_key": cycles_source_key,
+        },
     }
-    
-    # Duration
-    if records:
-        t_start = records[0].get("t_abs_s", 0)
-        t_end = records[-1].get("t_abs_s", 0)
-        results["duration_s"] = t_end - t_start
-    
-    run_duration = results["duration_s"]
-    
-    # Trackers
-    prev_direction = None
-    scrape_start = None
-    scrape_max_dtC = 0
-    scrape_without_disp_count = 0
-    high_activity_count = 0
-    
-    for i, rec in enumerate(records):
-        t = rec.get("t_abs_s", 0)
-        l1 = rec.get("l1", {})
-        l2 = rec.get("l2", {})
-        
-        state = l1.get("state", "STILL")
-        reason = l1.get("reason", "")
-        activity_score = l1.get("activity_score", 0)
-        
-        # Get delta_theta - prefer signed if available (v2.0.5+)
-        if "delta_theta_deg_signed" in rec:
-            delta_theta_signed = rec["delta_theta_deg_signed"]
-        elif "delta_theta_deg_raw" in rec:
-            delta_theta_signed = wrap_deg_signed(rec["delta_theta_deg_raw"])
-        else:
-            # Fallback to l1 field
-            raw = l1.get("delta_theta_deg", 0)
-            delta_theta_signed = wrap_deg_signed(raw)
-        
-        delta_cycles = rec.get("delta_cycles_physical", 0)
-        events_batch = rec.get("events_this_batch", 0)
-        
-        # dt's with clamp (Patch P2)
-        dtC = rec.get("dt_since_last_cycle_s", 0)
-        dtE = rec.get("dt_since_last_event_s", 0)
-        dtC = min(dtC, run_duration) if run_duration > 0 else dtC
-        dtE = min(dtE, run_duration) if run_duration > 0 else dtE
-        
-        direction = l2.get("direction", "UNDECIDED")
-        
-        # State counts
-        results["state_counts"][state] += 1
-        results["reason_counts"][reason] += 1
-        
-        # Total events
-        results["total_events"] += events_batch
-        
-        # First displacement (Patch P1: use signed)
-        if results["first_displacement"] is None and abs(delta_theta_signed) > 0.1:
-            results["first_displacement"] = {
-                "t_abs_s": t,
-                "record_index": i,
-                "delta_theta_deg_signed": delta_theta_signed,
-                "delta_cycles": delta_cycles,
-                "dtC": dtC,
-                "dtE": dtE,
-                "state": state,
-                "reason": reason,
-            }
-        
-        # Total cycles
-        results["total_cycles"] = rec.get("cycles_physical_total", 0)
-        
-        # Delta theta histogram (Patch P1: signed, bucket by 15°)
-        if abs(delta_theta_signed) > 0.1:
-            bucket = round(delta_theta_signed / 15) * 15
-            results["delta_theta_histogram_signed"][bucket] += 1
-            
-            results["top_delta_theta"].append({
-                "t_abs_s": t,
-                "delta_theta_deg_signed": delta_theta_signed,
-                "delta_cycles": delta_cycles,
-                "state": state,
-            })
-        
-        # Delta cycles histogram (Patch P3)
-        if delta_cycles != 0:
-            # Round to 0.5 buckets
-            bucket = round(delta_cycles * 2) / 2
-            results["delta_cycles_histogram"][bucket] += 1
-        
-        # Scrape detection
-        if state == "SCRAPE":
-            if scrape_start is None:
-                scrape_start = t
-                scrape_max_dtC = dtC
-            else:
-                scrape_max_dtC = max(scrape_max_dtC, dtC)
-        else:
-            if scrape_start is not None and scrape_max_dtC > 0.3:
-                results["scrape_segments"].append({
-                    "t_start": scrape_start,
-                    "t_end": t,
-                    "duration_s": t - scrape_start,
-                    "max_dtC": min(scrape_max_dtC, run_duration),  # Patch P2
-                })
-            scrape_start = None
-            scrape_max_dtC = 0
-        
-        # Scrape without displacement score (Patch P3)
-        if activity_score >= 5.0:  # A1 threshold
-            high_activity_count += 1
-            if delta_cycles == 0:
-                scrape_without_disp_count += 1
-        
-        # Direction flips
-        if direction in ("CW", "CCW"):
-            if prev_direction and prev_direction != direction:
-                results["direction_flips"].append({
-                    "t_abs_s": t,
-                    "from": prev_direction,
-                    "to": direction,
-                })
-            prev_direction = direction
-    
-    # Sort top delta theta by absolute value
-    results["top_delta_theta"] = sorted(
-        results["top_delta_theta"],
-        key=lambda x: abs(x["delta_theta_deg_signed"]),
-        reverse=True
-    )[:10]
-    
-    # Scrape without displacement fraction (Patch P3)
-    if high_activity_count > 0:
-        results["scrape_without_disp_fraction"] = scrape_without_disp_count / high_activity_count
-    
-    return results
 
+def fmt_t(t): return f"{t:.2f}s" if t is not None else "-"
 
-def print_analysis(filepath: str, results: Dict[str, Any]):
-    """Print analysis with improved UX (Patch P4)."""
-    print()
+def report(r, path):
     print("=" * 70)
-    print(f"  HANDENCODER LOG ANALYSIS v2: {Path(filepath).name}")
+    print(f"  V4.7b CANONICAL CYCLE TRUTH ANALYSIS: {path}")
     print("=" * 70)
-    print()
+    print(f"\n  Records: {r['n_records']}  Duration: {r['duration_s']:.1f}s")
+    print(f"  Events: {r['total_events']}")
+    print(f"  MDI Mode: {r['mdi_mode']}")
     
-    # Summary
-    print(f"  Duration:      {results['duration_s']:.1f}s")
-    print(f"  Records:       {results['total_records']}")
-    print(f"  Total events:  {results['total_events']}")
-    print(f"  Total cycles:  {results['total_cycles']:.0f}")
-    print()
+    ct = r.get("cycle_truth", {})
+    print("\n" + "-" * 70)
+    print("  CANONICAL CYCLE TRUTH (v1.9)")
+    used = ct.get("total_cycles_physical_final", 0)
+    cb = ct.get("cb_total_final", 0)
+    src = ct.get("source_key", "total_cycles_physical")
+    print(f"  total_cycles_physical: {used}")
+    print(f"  CB cycles_total:       {cb}")
+    print(f"  Source key:            {src}")
+    print(f"  Mismatches logged:     {ct.get('mismatches_logged', 0)}")
     
-    # === FIRST DISPLACEMENT (Patch P4: enhanced) ===
-    print("─" * 70)
-    print("  FIRST DISPLACEMENT")
-    print("─" * 70)
-    fd = results.get("first_displacement")
-    if fd:
-        print(f"  Time:     t = {fd['t_abs_s']:.2f}s (record #{fd['record_index']})")
-        print(f"  Δθ:       {fd['delta_theta_deg_signed']:+.1f}° (SIGNED)")
-        print(f"  Δcycles:  {fd['delta_cycles']}")
-        print(f"  dtC:      {fd['dtC']:.2f}s  dtE: {fd['dtE']:.2f}s")
-        print(f"  State:    {fd['state']} ({fd['reason']})")
-        print()
-        # Patch P4: Interpretation
-        dtheta = fd['delta_theta_deg_signed']
-        if abs(dtheta) <= 45:
-            interp = f"Micro-step ({'+' if dtheta > 0 else '-'}{abs(dtheta):.0f}° ≈ {abs(dtheta)/30:.1f} cycles)"
+    if cb > 0 and used == 0:
+        if r['total_events'] < 50:
+            print(f"\n  ℹ️  Boot phase: {cb} CB cycles, tiles not yet created")
         else:
-            interp = f"Larger movement ({dtheta:+.0f}°)"
-        print(f"  → Interpretatie: {interp}")
-        print(f"  → Signed Δθ voorkomt wrap artifacts (+345° → -15°)")
+            print(f"\n  ⚠️  Possible issue: CB={cb} but MovementBody=0")
+    elif used > 0:
+        print(f"\n  ✅ Cycles flowing to MovementBody")
     else:
-        print("  ⚠️  No displacement detected in entire session!")
-        print("  → Mogelijk alleen scrape/touch activiteit")
-    print()
+        print(f"\n  ℹ️  No cycles (normal for short burst)")
     
-    # State distribution
-    print("─" * 70)
-    print("  STATE DISTRIBUTION")
-    print("─" * 70)
-    for state, count in sorted(results["state_counts"].items(), key=lambda x: -x[1]):
-        pct = count / results["total_records"] * 100
-        bar = "█" * int(pct / 5)
-        print(f"  {state:12} {count:6} ({pct:5.1f}%) {bar}")
-    print()
+    print("\n" + "-" * 70 + "\n  MDI")
+    mdi = r.get("mdi", {})
+    print(f"  Max micro displacement: {mdi.get('max_disp_deg', 0):.1f}°")
+    ev = mdi.get("ev_win_stats", {})
+    if ev: print(f"  ev_win: min={ev.get('min')} median={ev.get('median')} max={ev.get('max')}")
     
-    # Reason distribution
-    print("─" * 70)
-    print("  REASON DISTRIBUTION (top 8)")
-    print("─" * 70)
-    for reason, count in sorted(results["reason_counts"].items(), key=lambda x: -x[1])[:8]:
-        pct = count / results["total_records"] * 100
-        print(f"  {reason:30} {count:5} ({pct:4.1f}%)")
-    print()
+    lt = r.get("latch", {})
+    if r['mdi_mode'] == "C":
+        print(f"\n  LATCH: episodes={lt.get('episodes',0)} dropped={lt.get('dropped',0)} confirmed={lt.get('confirmed',0)}")
     
-    # === DELTA THETA HISTOGRAM (Patch P1: signed) ===
-    print("─" * 70)
-    print("  Δθ HISTOGRAM (SIGNED, 15° buckets)")
-    print("─" * 70)
-    hist = results["delta_theta_histogram_signed"]
-    if hist:
-        max_count = max(hist.values()) if hist else 1
-        for bucket in sorted(hist.keys()):
-            count = hist[bucket]
-            bar_len = int(count / max_count * 30)
-            bar = "█" * bar_len
-            print(f"  {bucket:+4.0f}° : {count:4} {bar}")
-        print()
-        print(f"  → Verwacht: ±15°, ±30°, ±45°... bij 24-magneet rotor (12 cycles/rot)")
+    print("\n" + "-" * 70 + "\n  TIMELINE")
+    tl = r["timeline"]
+    print(f"  First micro_t0:      {fmt_t(tl.get('first_micro_t0_s'))}")
+    print(f"  First PRE_MOVEMENT:  {fmt_t(tl.get('first_pre_movement_s'))}")
+    print(f"  First CANDIDATE:     {fmt_t(tl.get('first_candidate_s'))}")
+    print(f"  First COMMIT:        {fmt_t(tl.get('first_commit_s'))}")
+    print(f"  First MOVEMENT:      {fmt_t(tl.get('first_movement_s'))}")
+    
+    print("\n" + "=" * 70 + "\n  DIAGNOSIS\n" + "=" * 70)
+    issues = []
+    pre_mov = r["aw_states"].get("PRE_MOVEMENT", 0) > 0
+    if pre_mov: issues.append("✅ Test-1 PASS: PRE_MOVEMENT detected")
     else:
-        print("  No displacement events")
-    print()
-    
-    # === DELTA CYCLES HISTOGRAM (Patch P3) ===
-    print("─" * 70)
-    print("  Δcycles HISTOGRAM")
-    print("─" * 70)
-    hist_cy = results["delta_cycles_histogram"]
-    if hist_cy:
-        max_count = max(hist_cy.values()) if hist_cy else 1
-        for bucket in sorted(hist_cy.keys()):
-            count = hist_cy[bucket]
-            bar_len = int(count / max_count * 25)
-            bar = "█" * bar_len
-            print(f"  {bucket:+5.1f} : {count:4} {bar}")
-        print()
-        print(f"  → Verwacht: 0.5 of 1.0 bij normale stappen")
-    else:
-        print("  No cycle changes")
-    print()
-    
-    # Top 10 delta theta (Patch P1: signed)
-    print("─" * 70)
-    print("  TOP 10 LARGEST |Δθ| (SIGNED)")
-    print("─" * 70)
-    for i, item in enumerate(results["top_delta_theta"][:10], 1):
-        print(f"  {i:2}. t={item['t_abs_s']:6.2f}s  Δθ={item['delta_theta_deg_signed']:+6.1f}°  "
-              f"Δcy={item['delta_cycles']:+.0f}  {item['state']}")
-    if not results["top_delta_theta"]:
-        print("  None")
-    print()
-    
-    # === SCRAPE WITHOUT DISPLACEMENT (Patch P3) ===
-    print("─" * 70)
-    print("  SCRAPE WITHOUT DISPLACEMENT")
-    print("─" * 70)
-    swd_frac = results["scrape_without_disp_fraction"]
-    print(f"  Fraction: {swd_frac:.1%} of high-activity ticks had Δcycles=0")
-    if swd_frac > 0.5:
-        print("  → Veel edge-oscillatie of threshold-scrape gedetecteerd")
-    elif swd_frac > 0.2:
-        print("  → Enige scrape activiteit")
-    else:
-        print("  → Meestal echte beweging bij hoge activiteit")
-    print()
-    
-    # Scrape segments (Patch P2: clamped dtC)
-    print("─" * 70)
-    print("  SCRAPE SEGMENTS (activity without displacement)")
-    print("─" * 70)
-    scrapes = results["scrape_segments"]
-    if scrapes:
-        for seg in scrapes[:5]:
-            print(f"  t={seg['t_start']:.1f}s → {seg['t_end']:.1f}s  "
-                  f"dur={seg['duration_s']:.2f}s  max_dtC={seg['max_dtC']:.2f}s")
-        if len(scrapes) > 5:
-            print(f"  ... and {len(scrapes) - 5} more")
-    else:
-        print("  No significant scrape segments")
-    print()
-    
-    # Direction flips
-    print("─" * 70)
-    print("  DIRECTION FLIPS")
-    print("─" * 70)
-    flips = results["direction_flips"]
-    if flips:
-        for flip in flips[:10]:
-            print(f"  t={flip['t_abs_s']:.2f}s  {flip['from']} → {flip['to']}")
-        if len(flips) > 10:
-            print(f"  ... and {len(flips) - 10} more")
-    else:
-        print("  No direction flips")
-    print()
-    
+        issues.append("❌ Test-1 FAIL: No PRE_MOVEMENT")
+        if mdi.get("max_disp_deg", 0) > 0:
+            issues.append(f"   → MDI had displacement ({mdi['max_disp_deg']:.0f}°)")
+    if used == 0 and cb == 0:
+        issues.append("ℹ️  No cycles (expected for short burst)")
+    elif used > 0:
+        issues.append(f"✅ Cycles OK: {used:.0f} reached MovementBody")
+    for i in issues: print(f"  {i}")
     print("=" * 70)
-    print()
-
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Analyze handencoder log files (v2 - signed angles)'
-    )
-    parser.add_argument('files', nargs='+', help='JSONL log files')
-    parser.add_argument('--summary', action='store_true',
-                       help='Only show summary per file')
-    parser.add_argument('--json', action='store_true',
-                       help='Output as JSON')
-    
-    args = parser.parse_args()
-    
-    for filepath in args.files:
-        if not Path(filepath).exists():
-            print(f"❌ File not found: {filepath}")
-            continue
-        
-        records = load_log(filepath)
-        results = analyze_log(records)
-        
-        if args.json:
-            results["delta_theta_histogram_signed"] = dict(results["delta_theta_histogram_signed"])
-            results["delta_cycles_histogram"] = dict(results["delta_cycles_histogram"])
-            results["state_counts"] = dict(results["state_counts"])
-            results["reason_counts"] = dict(results["reason_counts"])
-            print(json.dumps(results, indent=2))
-        elif args.summary:
-            fd = results.get("first_displacement")
-            fd_str = f"t={fd['t_abs_s']:.1f}s Δθ={fd['delta_theta_deg_signed']:+.0f}°" if fd else "none"
-            swd = results["scrape_without_disp_fraction"]
-            print(f"{Path(filepath).name}: {results['duration_s']:.1f}s, "
-                  f"{results['total_cycles']:.0f}cy, "
-                  f"first: {fd_str}, "
-                  f"scrape_no_disp: {swd:.0%}, "
-                  f"flips: {len(results['direction_flips'])}")
-        else:
-            print_analysis(filepath, results)
-    
+    if len(sys.argv) < 2: print("Usage: analyze_handencoder_log.py <file.jsonl>"); return 1
+    path = sys.argv[1]
+    if not Path(path).exists(): print(f"❌ Not found: {path}"); return 1
+    records = load_jsonl(path)
+    if not records: print("❌ Empty"); return 1
+    result = analyze(records)
+    if "--json" in sys.argv: print(json.dumps(result, indent=2, default=str))
+    else: report(result, path)
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__": sys.exit(main())
