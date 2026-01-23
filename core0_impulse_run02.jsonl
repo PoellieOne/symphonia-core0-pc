@@ -1,0 +1,41 @@
+{"kind": "impulse_marker", "marker_code": 1, "ts_us": 137350}
+{"kind": "impulse_sample", "ts_us": 140693, "hall0": 1818, "hall1": 872, "virt_angle_q16": 4665, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 143631, "hall0": 1826, "hall1": 848, "virt_angle_q16": 4535, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 146761, "hall0": 1829, "hall1": 837, "virt_angle_q16": 4476, "marker": 0}
+{"kind": "impulse_marker", "marker_code": 2, "ts_us": 147350}
+{"kind": "impulse_marker", "marker_code": 3, "ts_us": 149350}
+{"kind": "impulse_sample", "ts_us": 149932, "hall0": 1822, "hall1": 822, "virt_angle_q16": 4420, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 153017, "hall0": 1831, "hall1": 847, "virt_angle_q16": 4519, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 156114, "hall0": 1826, "hall1": 879, "virt_angle_q16": 4679, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 159237, "hall0": 1825, "hall1": 879, "virt_angle_q16": 4682, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 162410, "hall0": 1823, "hall1": 861, "virt_angle_q16": 4602, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 165531, "hall0": 1826, "hall1": 839, "virt_angle_q16": 4492, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 168661, "hall0": 1829, "hall1": 825, "virt_angle_q16": 4420, "marker": 0}
+{"kind": "impulse_marker", "marker_code": 4, "ts_us": 169350}
+{"kind": "impulse_sample", "ts_us": 171791, "hall0": 1825, "hall1": 853, "virt_angle_q16": 4560, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 174921, "hall0": 1825, "hall1": 871, "virt_angle_q16": 4644, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 178007, "hall0": 1829, "hall1": 877, "virt_angle_q16": 4663, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 181137, "hall0": 1840, "hall1": 865, "virt_angle_q16": 4584, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 184327, "hall0": 1814, "hall1": 841, "virt_angle_q16": 4528, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 187441, "hall0": 1828, "hall1": 825, "virt_angle_q16": 4422, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 190584, "hall0": 1825, "hall1": 829, "virt_angle_q16": 4447, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 193707, "hall0": 1831, "hall1": 862, "virt_angle_q16": 4589, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 196821, "hall0": 1830, "hall1": 870, "virt_angle_q16": 4629, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 199965, "hall0": 1825, "hall1": 871, "virt_angle_q16": 4644, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 203056, "hall0": 1833, "hall1": 854, "virt_angle_q16": 4548, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 206167, "hall0": 1824, "hall1": 833, "virt_angle_q16": 4468, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 209341, "hall0": 1826, "hall1": 822, "virt_angle_q16": 4412, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 212471, "hall0": 1828, "hall1": 850, "virt_angle_q16": 4540, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 215601, "hall0": 1824, "hall1": 871, "virt_angle_q16": 4647, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 218731, "hall0": 1828, "hall1": 880, "virt_angle_q16": 4680, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 221851, "hall0": 1834, "hall1": 867, "virt_angle_q16": 4606, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 224977, "hall0": 1826, "hall1": 839, "virt_angle_q16": 4492, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 228067, "hall0": 1834, "hall1": 820, "virt_angle_q16": 4385, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 231197, "hall0": 1824, "hall1": 846, "virt_angle_q16": 4530, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 234391, "hall0": 1831, "hall1": 865, "virt_angle_q16": 4603, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 237501, "hall0": 1826, "hall1": 875, "virt_angle_q16": 4661, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 240631, "hall0": 1826, "hall1": 864, "virt_angle_q16": 4610, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 243777, "hall0": 1819, "hall1": 848, "virt_angle_q16": 4550, "marker": 0}
+{"kind": "impulse_sample", "ts_us": 246891, "hall0": 1833, "hall1": 829, "virt_angle_q16": 4430, "marker": 0}
+{"kind": "impulse_marker", "marker_code": 5, "ts_us": 249350}
+{"kind": "impulse_marker", "marker_code": 6, "ts_us": 249350}

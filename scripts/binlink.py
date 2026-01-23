@@ -9,6 +9,7 @@ TYPE_SUMMARY16    = 0x2  # Legacy
 TYPE_SUMMARY24    = 0x3  # Legacy
 TYPE_FILTER_STATS = 0x4  # NEW: Filter layer statistics
 TYPE_LINK_STATS   = 0x5  # NEW: Transport layer statistics
+TYPE_IMPULSE_TEST = 0x6  # NEW: Micro-Impulse sample/marker
 
 def crc16_ccitt_false(data: bytes) -> int:
     crc = 0xFFFF
@@ -204,6 +205,40 @@ def parse_link_stats(p):
         # Convert 0-255 scale to 0-100%
         "queue_fill_normalized": fields[6] * 100.0 / 255.0,
     }
+
+def parse_impulse_frame(p):
+    """
+    PKT_IMPULSE_TEST (0x6) - Micro-Impulse sample/marker
+
+    Sample payload (11 bytes):
+      [0-3]   ts_us           - Timestamp (uint32)
+      [4-5]   hall0           - Raw hall A (int16)
+      [6-7]   hall1           - Raw hall B (int16)
+      [8-9]   virt_angle_q16  - 0..65535 => 0..360 deg
+      [10]    marker          - 0 for samples
+
+    Marker payload (5 bytes):
+      [0]     marker_code     - 1..6
+      [1-4]   ts_us           - Timestamp (uint32)
+    """
+    if len(p) == 11:
+        ts_us, hall0, hall1, angle_q16, marker = struct.unpack('<IhhHB', p)
+        return {
+            "kind": "impulse_sample",
+            "ts_us": ts_us,
+            "hall0": hall0,
+            "hall1": hall1,
+            "virt_angle_q16": angle_q16,
+            "marker": marker,
+        }
+    if len(p) == 5:
+        marker_code, ts_us = struct.unpack('<BI', p)
+        return {
+            "kind": "impulse_marker",
+            "marker_code": marker_code,
+            "ts_us": ts_us,
+        }
+    return {"kind": "impulse_unknown", "len": len(p)}
 
 def decode_flags(flags0, flags1):
     pair      = (flags0 >> 7) & 1

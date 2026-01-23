@@ -5,9 +5,11 @@ from binlink import (
     TYPE_EVENT16, TYPE_EVENT24,
     TYPE_SUMMARY16, TYPE_SUMMARY24,
     TYPE_FILTER_STATS, TYPE_LINK_STATS,
+    TYPE_IMPULSE_TEST,
     parse_event16, parse_event24,
     parse_summary16, parse_summary24,
     parse_filter_stats, parse_link_stats,
+    parse_impulse_frame,
     decode_flags,
     BatchWriter
 )
@@ -45,6 +47,7 @@ def main():
     flt = BatchWriter("core0_filter_stats.jsonl", batch_size=32,  flush_ms=800)
     lnk = BatchWriter("core0_link_stats.jsonl",   batch_size=32,  flush_ms=800)
     leg = BatchWriter("core0_legacy.jsonl",       batch_size=32,  flush_ms=800)  # Voor legacy summaries
+    imp = BatchWriter("core0_impulse.jsonl",      batch_size=64,  flush_ms=400)
 
     print(f"[capture] listening on {PORT} @ {BAUD} … (Ctrl+C to stop)")
     print(f"[capture] writing to:")
@@ -52,6 +55,7 @@ def main():
     print(f"  - filter stats: core0_filter_stats.jsonl")
     print(f"  - link stats:   core0_link_stats.jsonl")
     print(f"  - legacy:       core0_legacy.jsonl")
+    print(f"  - impulse:      core0_impulse.jsonl")
     print()
 
     events_seen = 0
@@ -102,6 +106,13 @@ def main():
                 leg.add(json.dumps(sm))
                 print(f"[LEGACY16] emitted={sm['emitted']}, dropped={sm['dropped']}")
 
+            # === IMPULSE TEST ===
+            elif t == TYPE_IMPULSE_TEST:
+                imp_data = parse_impulse_frame(payload)
+                imp.add(json.dumps(imp_data))
+                if imp_data.get("kind") == "impulse_marker":
+                    print(f"[IMPULSE] marker={imp_data['marker_code']} ts_us={imp_data['ts_us']}")
+
             # === UNKNOWN PACKETS ===
             else:
                 print(f"[debug] unknown frame type={t} ver={v} len={len(payload)}")
@@ -128,6 +139,7 @@ def main():
         flt.close()
         lnk.close()
         leg.close()
+        imp.close()
         ser.close()
 
         # Final statistics
